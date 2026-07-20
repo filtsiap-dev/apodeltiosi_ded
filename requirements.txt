@@ -1,0 +1,12 @@
+# Runtime dependencies — keep in sync with [project.dependencies] in pyproject.toml.
+# Install with: pip install -r requirements.txt
+# (pip install -e . is the alternative that also registers the anonymizer package
+# itself as editable and reads this same list from pyproject.toml.)
+fastapi
+uvicorn
+gunicorn
+uvicorn-worker
+openai
+lxml
+pyyaml
+python-stdnum

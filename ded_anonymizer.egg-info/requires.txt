@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+gunicorn
+uvicorn-worker
+openai
+lxml
+pyyaml
+python-stdnum
+
+[dev]
+pytest
+ruff
+mypy
+httpx
