@@ -1,0 +1,21 @@
+# Never commit real secrets.
+.env
+
+# Build / runtime artifacts.
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Docker files — kept locally, not tracked in this repo.
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Docs / reports — not tracked.
+BUILDER_REPORT.md
+CODEBASE_GUIDE.md
+skill_analysis_reusable_patterns.md
+
+# Tests — not tracked.
+tests/
