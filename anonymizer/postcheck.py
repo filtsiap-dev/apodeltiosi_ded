@@ -1,9 +1,14 @@
-"""Optional public post-redaction audit (Task 10B).
+"""Mandatory post-redaction audit.
 
-Scans REDACTED output for residual leaks. This is out-of-band: nothing in the
-serving pipeline imports it. ``detail`` never echoes matched document text,
-except for ``wrong_placeholder`` and ``over_redaction`` where the match cannot
-be PII by construction. This module does not log.
+Scans REDACTED output for residual leaks. ``anonymize_document`` calls this on
+every document as its final stage, after ``write_redacted_docx`` and before any
+caller can save or return the bytes: a HIGH-severity finding aborts the document
+with ``ResidualPIIError`` instead of releasing it, and lower-severity findings
+ride along on the result. Nothing here contacts the network or writes anything.
+
+``detail`` never echoes matched document text, except for ``wrong_placeholder``
+and ``over_redaction`` where the match cannot be PII by construction. This
+module does not log.
 """
 
 from __future__ import annotations

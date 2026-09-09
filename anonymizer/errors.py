@@ -10,6 +10,15 @@ class DocumentProcessingError(AnonymizerError):
     """Valid DOCX but a redaction plan cannot be produced or applied."""
 
 
+class ResidualPIIError(AnonymizerError):
+    """The redacted DOCX failed its mandatory post-redaction scan.
+
+    Raised after redaction succeeded but the scan of the produced file still
+    found HIGH-severity personal information. The document is never returned or
+    saved as a successful result; it needs manual review.
+    """
+
+
 class ConfigurationError(AnonymizerError):
     """Missing or invalid runtime configuration."""
 

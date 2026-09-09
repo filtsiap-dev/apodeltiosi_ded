@@ -12,6 +12,15 @@ In pass-2 handling the category is validated FIRST, before the action switch,
 so REVIEW→REDACT coercion warnings fire only for entries that survive to
 produce spans.
 
+Pass-2 output is required to be COMPLETE, not merely parseable. Its JSON is
+validated item by item, and every rule-flagged REVIEW hint in the chunk must
+come back with a final REDACT or PRESERVE decision. An unparseable or
+incomplete response is retried exactly once, with the missing texts named; if
+the retry is still incomplete the document is abandoned with AIProviderError
+rather than letting a missing decision pass for a safe one. Deterministic
+REDACT spans do not depend on any of this — the pipeline keeps them in the plan
+whether or not pass 2 repeats them.
+
 The LLM stage is MANDATORY: there is no enabled/disabled switch and no
 no-client fallback. ``client`` is duck-typed; ``openai`` is imported only for
 its exception types.
@@ -36,6 +45,7 @@ from anonymizer.llm.prompts import (
     SYSTEM_PROMPT_PASS2,
     build_pass1_message,
     build_pass2_message,
+    build_pass2_retry_message,
 )
 from anonymizer.models import ALL_CATEGORIES, DocumentData, Span, TextUnit
 
@@ -237,47 +247,125 @@ def parse_pass1_findings(raw: str) -> list[dict]:
 # Pass-2 parsing (STRICT) — produces spans
 # ---------------------------------------------------------------------------
 
-def parse_pass2_spans(raw: str, chunk: Chunk) -> list[Span]:
-    """Parse pass-2 output strictly into located spans.
+@dataclass
+class Pass2Decision:
+    """One validated pass-2 entry, after alias resolution and coercion.
 
-    Unparseable or non-list output raises ``AIProviderError``. The category is
-    validated FIRST — alias-resolved and checked against ``ALL_CATEGORIES`` —
-    before the action switch, so the REVIEW→REDACT coercion warning fires only
-    for entries that survive validation AND locate at least one span. Each kept
-    entry is located in every unit of the chunk via repeated ``str.find``;
-    short REDACT texts (< 4 chars) are accepted only as standalone tokens.
+    ``action`` is always final (REDACT, PRESERVE, or SKIP): the illegal REVIEW
+    action has already been coerced to REDACT, which ``coerced`` records.
+    """
+
+    text: str
+    category: str
+    action: str
+    coerced: bool
+
+
+def validate_pass2_entries(raw: str) -> list[Pass2Decision]:
+    """Validate pass-2 output item by item into final decisions.
+
+    Raises ``AIProviderError`` when the payload is not a JSON array — that is a
+    malformed response, not a set of decisions. Within a well-formed array each
+    item is checked on its own and a bad one is DROPPED, never guessed at: a
+    non-object, an empty ``text``, or a category that is not in the schema after
+    alias resolution. Category is checked before action, so a REVIEW→REDACT
+    coercion is only ever recorded for an entry that is otherwise valid.
+
+    Dropping is safe here only because the caller separately proves that every
+    rule-flagged REVIEW hint still received a decision; see
+    ``unresolved_review_hints``.
     """
     decisions = _extract_json_array(raw)
     if decisions is None:
         raise AIProviderError("pass-2 output could not be parsed as a JSON array")
 
-    spans: list[Span] = []
-    unlocated = 0
+    validated: list[Pass2Decision] = []
+    dropped = 0
     for entry in decisions:
         if not isinstance(entry, dict):
+            dropped += 1
             continue
         text = str(entry.get("text", "")).strip()
         if not text:
+            dropped += 1
             continue
 
-        # Category first: an entry with an invalid category is dropped before
-        # any action handling, so it can never trigger a coercion warning.
         category = str(entry.get("category", "")).strip().upper()
         category = _CATEGORY_ALIASES.get(category, category)
         if category not in ALL_CATEGORIES:
             logger.debug("pass-2 dropping entry with invalid category")
+            dropped += 1
             continue
 
         action = str(entry.get("action", "")).strip().upper()
-        if action == "SKIP":
-            continue
-        was_coerced = False
+        coerced = False
         if action == "REVIEW":
             action = "REDACT"
-            was_coerced = True
-        if action not in {"REDACT", "PRESERVE"}:
+            coerced = True
+        if action not in {"REDACT", "PRESERVE", "SKIP"}:
             logger.debug("pass-2 dropping entry with unsupported action")
+            dropped += 1
             continue
+
+        validated.append(Pass2Decision(text=text, category=category, action=action,
+                                       coerced=coerced))
+
+    if dropped:
+        logger.warning("pass-2: dropped %d invalid entry/entries", dropped)
+    return validated
+
+
+def _covers(decision_text: str, hint_text: str) -> bool:
+    """Return True when a pass-2 decision addresses the text of a REVIEW hint.
+
+    Whitespace-normalized and case-insensitive, and satisfied by containment in
+    either direction: a model that answers about the whole authority header has
+    decided the name inside it, and one that answers about a surname has
+    addressed the hint that carried the full name. Anything looser would let an
+    unrelated decision stand in for a missing one.
+    """
+    a = " ".join(decision_text.split()).casefold()
+    b = " ".join(hint_text.split()).casefold()
+    if not a or not b:
+        return False
+    return a == b or a in b or b in a
+
+
+def unresolved_review_hints(decisions: list[Pass2Decision], hints: list[Span]) -> list[str]:
+    """Return the texts of rule-flagged REVIEW hints pass 2 left undecided.
+
+    A hint counts as resolved only when some validated decision covering its
+    text carries a final REDACT or PRESERVE. SKIP does not resolve one: the
+    whole point of a REVIEW hint is that the rules could not tell, so dropping
+    it silently is the failure this check exists to catch. An empty list means
+    the response is complete.
+    """
+    decided = [d for d in decisions if d.action in {"REDACT", "PRESERVE"}]
+    unresolved: list[str] = []
+    for hint in hints:
+        if any(_covers(d.text, hint.text) for d in decided):
+            continue
+        if hint.text not in unresolved:
+            unresolved.append(hint.text)
+    return unresolved
+
+
+def locate_pass2_decisions(decisions: list[Pass2Decision], chunk: Chunk) -> list[Span]:
+    """Locate validated pass-2 decisions in the chunk's units, producing spans.
+
+    SKIP decisions produce nothing. Each remaining entry is located in every
+    unit via repeated ``str.find``; short REDACT texts (< 4 chars) are accepted
+    only as standalone tokens. A decision whose text appears in no unit is
+    dropped with a warning — pass 2 is the sole span producer, so losses must be
+    visible.
+    """
+    spans: list[Span] = []
+    unlocated = 0
+    for decision in decisions:
+        if decision.action == "SKIP":
+            continue
+        text, category, action = decision.text, decision.category, decision.action
+        was_coerced = decision.coerced
 
         guard_short = action == "REDACT" and len(text) < 4
 
@@ -327,6 +415,16 @@ def parse_pass2_spans(raw: str, chunk: Chunk) -> list[Span]:
             unlocated,
         )
     return spans
+
+
+def parse_pass2_spans(raw: str, chunk: Chunk) -> list[Span]:
+    """Validate pass-2 output and locate it into spans, in one call.
+
+    The composition of ``validate_pass2_entries`` and ``locate_pass2_decisions``.
+    It performs NO completeness check — ``run_llm_detection`` owns that, because
+    only it knows the chunk's rule-flagged REVIEW hints and can retry.
+    """
+    return locate_pass2_decisions(validate_pass2_entries(raw), chunk)
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +554,56 @@ def _call(
 # Orchestration
 # ---------------------------------------------------------------------------
 
+def _pass2_attempt(
+    client: Any,
+    cfg: RuntimeConfig,
+    chunk: Chunk,
+    known_spans: list[dict],
+    hints: list[Span],
+    chunk_index: int,
+    *,
+    retry: bool,
+    retry_reason: str = "",
+    unresolved: list[str] | None = None,
+) -> tuple[list[Pass2Decision], str | None, list[str]]:
+    """Make one pass-2 call and judge whether its output is usable.
+
+    Returns ``(decisions, reason, unresolved)``. ``reason`` is None when the
+    response is valid and complete; otherwise it is a short phrase naming what
+    was wrong, suitable for the retry message and the final error. The retry
+    call re-sends the same system prompt with the original message plus the
+    texts still awaiting a decision.
+
+    Provider/transport failures are NOT judged here: ``_call`` raises for those
+    and the exception aborts the run as before.
+    """
+    if retry:
+        message = build_pass2_retry_message(
+            chunk.text, known_spans, unresolved or [], retry_reason
+        )
+    else:
+        message = build_pass2_message(chunk.text, known_spans)
+
+    raw = _call(client, cfg, SYSTEM_PROMPT_PASS2, message, chunk_index, 2)
+
+    try:
+        decisions = validate_pass2_entries(raw)
+    except AIProviderError as exc:
+        # Malformed output is a rejected attempt, not yet a failed document:
+        # the caller decides whether a retry is still available.
+        return [], str(exc), list(unresolved or [])
+
+    still_unresolved = unresolved_review_hints(decisions, hints)
+    if still_unresolved:
+        return (
+            decisions,
+            f"{len(still_unresolved)} rule-flagged REVIEW entry/entries received "
+            f"no REDACT or PRESERVE decision",
+            still_unresolved,
+        )
+    return decisions, None, []
+
+
 def run_llm_detection(
     document: DocumentData,
     deterministic_spans: list[Span],
@@ -471,10 +619,17 @@ def run_llm_detection(
     order is strict: blind pass 1 proposes from scratch, then pass 2 receives
     the chunk text plus ALL known spans (deterministic detections and the
     located pass-1 proposals, each with category, action, and context) and
-    confirms, corrects, or adds. Results are collected in chunk order, so the
-    returned spans are deterministic regardless of completion order. The first
-    chunk failure cancels not-yet-started chunks and aborts the run. Only
-    pass-2 spans are collected and returned.
+    confirms, corrects, or adds.
+
+    Pass 2 must answer completely: its JSON is validated and every rule-flagged
+    REVIEW hint in the chunk must come back with a final REDACT or PRESERVE. A
+    malformed or incomplete answer is retried once, naming the missing texts;
+    a second failure raises AIProviderError and the document is abandoned.
+
+    Results are collected in chunk order, so the returned spans are
+    deterministic regardless of completion order. The first chunk failure
+    cancels not-yet-started chunks and aborts the run. Only pass-2 spans are
+    collected and returned.
     """
     units_by_id = {u.unit_id: u for u in document.text_units}
     chunks = split_into_chunks(document, cfg.chunk_size_chars)
@@ -506,17 +661,32 @@ def run_llm_detection(
             + [_finding_known_span(f, chunk) for f in findings]
         )
 
-        # Pass 2 — informed validation over the known spans.
+        # Pass 2 — informed validation over the known spans. The response
+        # must be valid AND complete; one corrective retry, then give up on the
+        # document rather than accept a missing decision as a safe one.
         logger.info(
             "chunk %d/%d: pass 2 (validation of %d known spans)",
             chunk_index + 1, total, len(known_spans),
         )
-        raw2 = _call(
-            client, cfg, SYSTEM_PROMPT_PASS2,
-            build_pass2_message(chunk.text, known_spans),
-            chunk_index, 2,
+        decisions, reason, unresolved = _pass2_attempt(
+            client, cfg, chunk, known_spans, chunk_hints, chunk_index, retry=False,
         )
-        chunk_spans = parse_pass2_spans(raw2, chunk)
+        if reason is not None:
+            logger.warning(
+                "chunk %d/%d: pass 2 rejected (%s); retrying once",
+                chunk_index + 1, total, reason,
+            )
+            decisions, reason, unresolved = _pass2_attempt(
+                client, cfg, chunk, known_spans, chunk_hints, chunk_index,
+                retry=True, retry_reason=reason, unresolved=unresolved,
+            )
+            if reason is not None:
+                raise AIProviderError(
+                    f"pass 2 still incomplete after one retry (chunk {chunk_index}): "
+                    f"{reason}"
+                )
+
+        chunk_spans = locate_pass2_decisions(decisions, chunk)
         logger.info(
             "chunk %d/%d: done — %d spans located (%.1fs)",
             chunk_index + 1, total, len(chunk_spans), time.time() - start_time,
@@ -545,8 +715,12 @@ def run_llm_detection(
 
 __all__ = [
     "Chunk",
+    "Pass2Decision",
     "split_into_chunks",
     "run_llm_detection",
     "parse_pass1_findings",
     "parse_pass2_spans",
+    "validate_pass2_entries",
+    "locate_pass2_decisions",
+    "unresolved_review_hints",
 ]

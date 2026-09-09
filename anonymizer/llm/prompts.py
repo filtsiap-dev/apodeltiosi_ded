@@ -17,7 +17,11 @@ differs.
 The following names are owned by this module and imported by
 ``anonymizer.llm.detector`` (and, for ``PROMPTS_SHA256``, by
 ``anonymizer.pipeline``): ``SYSTEM_PROMPT_PASS1``, ``SYSTEM_PROMPT_PASS2``,
-``build_pass1_message``, ``build_pass2_message``, ``PROMPTS_SHA256``.
+``build_pass1_message``, ``build_pass2_message``,
+``build_pass2_retry_message``, ``PROMPTS_SHA256``.
+
+``PROMPTS_SHA256`` covers the two SYSTEM prompts only. The retry builder below
+re-sends the same pass-2 system prompt, so it does not change provenance.
 """
 
 import hashlib
@@ -157,6 +161,39 @@ def build_pass1_message(chunk_text: str) -> str:
     suggestions or prior spans are ever included here.
     """
     return "DOCUMENT EXCERPT:\n" + chunk_text
+
+
+def build_pass2_retry_message(
+    chunk_text: str,
+    known_spans: list[dict],
+    unresolved: list[str],
+    reason: str,
+) -> str:
+    """Build the single pass-2 retry message.
+
+    Sent once, after a pass-2 response that could not be used: unparseable
+    output, or output that left rule-flagged REVIEW entries without a final
+    decision. It repeats the original message and appends exactly what went
+    wrong plus the verbatim texts still awaiting a decision, so the retry is a
+    correction rather than a blind second roll. ``reason`` is a short
+    machine-written phrase, never model text.
+    """
+    message = build_pass2_message(chunk_text, known_spans)
+    lines = [
+        message,
+        "",
+        f"YOUR PREVIOUS RESPONSE WAS REJECTED: {reason}.",
+        "Return the complete JSON array again — valid JSON, no markdown, no prose.",
+    ]
+    if unresolved:
+        lines += [
+            "",
+            "These KNOWN SPANS entries still have NO final decision. Each one MUST",
+            'appear in your response with "action" set to REDACT or PRESERVE '
+            "(REVIEW and SKIP are not decisions for these):",
+            json.dumps(unresolved, ensure_ascii=False),
+        ]
+    return "\n".join(lines)
 
 
 def build_pass2_message(chunk_text: str, known_spans: list[dict]) -> str:

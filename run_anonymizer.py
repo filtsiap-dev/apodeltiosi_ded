@@ -2,10 +2,10 @@
 
 This file is the ENTIRE command-line surface of the project. It imports only
 the public pipeline API (`load_runtime_config`, `load_file_config`,
-`build_client`, `anonymize_document`, `scan_redacted_docx_bytes`, and the typed
-error hierarchy) — no private names, no internals. Deleting this one file
-removes the CLI completely with zero edits to any pipeline module; the HTTP
-service (`anonymizer.api:app`) is unaffected either way.
+`build_client`, `anonymize_document`, and the typed error hierarchy) — no
+private names, no internals. Deleting this one file removes the CLI completely
+with zero edits to any pipeline module; the HTTP service
+(`anonymizer.api:app`) is unaffected either way.
 
 Configuration comes from the project `.env` file, always: the `.env` next to
 this script is loaded into the process environment automatically (via the
@@ -23,13 +23,20 @@ Usage (PowerShell, from the project root):
     # a plain positional path works the same way, as an alternative to --file:
     python .\\run_anonymizer.py .\\path\\to\\decision.docx
 
+Every document is scanned for residual personal information by the pipeline
+itself, after redaction and before this script writes anything. A HIGH-severity
+finding raises `ResidualPIIError`: no `*_redacted.docx` is written for that
+input, and it is reported as needing manual review. `--qa` only controls how
+much of that scan is printed; it cannot turn the scan off.
+
 Exit codes:
-    0  every document processed successfully (and, with --qa, no HIGH findings)
+    0  every document processed successfully
     1  at least one document failed to process
     2  usage error: no input given, both --file and the positional argument given,
        input path missing, or no .docx files found
     3  configuration error (missing/invalid environment or config/ files)
-    4  all documents processed, but --qa found HIGH-severity residual findings
+    4  every other document succeeded, but at least one was blocked by the
+       mandatory post-redaction scan and needs manual review
     130  interrupted by the user (Ctrl+C)
 """
 
@@ -43,10 +50,9 @@ import sys
 from pathlib import Path
 
 from anonymizer.config import load_env_file, load_file_config, load_runtime_config
-from anonymizer.errors import AnonymizerError, ConfigurationError
+from anonymizer.errors import AnonymizerError, ConfigurationError, ResidualPIIError
 from anonymizer.llm.client import build_client
 from anonymizer.pipeline import anonymize_document
-from anonymizer.postcheck import scan_redacted_docx_bytes
 
 logger = logging.getLogger("run_anonymizer")
 
@@ -54,7 +60,7 @@ EXIT_OK = 0
 EXIT_PROCESSING_FAILED = 1
 EXIT_USAGE = 2
 EXIT_CONFIG = 3
-EXIT_QA_HIGH = 4
+EXIT_QA_HIGH = 4  # blocked by the mandatory post-redaction scan
 
 _REDACTED_SUFFIX = "_redacted.docx"
 
@@ -105,8 +111,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--qa",
         action="store_true",
         help=(
-            "After redacting, run the out-of-band postcheck residual-leak audit "
-            "on each output and report its findings."
+            "Print every finding of the post-redaction residual-leak scan. "
+            "The scan itself always runs — this flag only makes it verbose."
         ),
     )
     parser.add_argument(
@@ -144,13 +150,15 @@ def _output_path(source: Path, out_dir: Path | None) -> Path:
     return target_dir / f"{source.stem}{_REDACTED_SUFFIX}"
 
 
-def _report_qa(redacted_bytes: bytes, files_config, source_name: str) -> int:
-    """Run the postcheck audit on redacted bytes and print its findings.
+def _print_qa(qa, source_name: str) -> None:
+    """Print the findings of the scan the pipeline already ran.
 
-    Returns the number of HIGH-severity findings; prints a per-kind breakdown
-    so the caller's log shows what survived redaction.
+    Takes the PostcheckSummary carried on the result — the scan is never run a
+    second time here. Any summary reaching this function is a passing one: a
+    HIGH finding aborts the document before it can be written or printed.
     """
-    qa = scan_redacted_docx_bytes(redacted_bytes, files_config)
+    if qa is None:
+        return
     status = "CLEAN" if qa.clean else "FINDINGS"
     print(
         f"  qa[{source_name}]: {status} total={qa.findings_total} "
@@ -161,7 +169,6 @@ def _report_qa(redacted_bytes: bytes, files_config, source_name: str) -> int:
             f"    {finding.severity:6} {finding.kind:28} {finding.location}: "
             f"{finding.detail}"
         )
-    return qa.by_severity.get("HIGH", 0)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -217,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_CONFIG
 
     failures = 0
-    qa_high_total = 0
+    needs_review = 0
     for source in sources:
         target = _output_path(source, out_dir)
         print(f"started: {source.name}")
@@ -229,6 +236,14 @@ def main(argv: list[str] | None = None) -> int:
                 client=client,
                 document_id=source.stem,
             )
+        except ResidualPIIError as exc:
+            # The pipeline redacted the file, but its mandatory scan still found
+            # HIGH-severity personal information. Nothing is written: a document
+            # that failed its own check must not be left looking like a result.
+            needs_review += 1
+            print(f"NEEDS MANUAL REVIEW  {source.name}: {exc}", file=sys.stderr)
+            print(f"  no file written to {target}", file=sys.stderr)
+            continue
         except AnonymizerError as exc:
             failures += 1
             print(f"FAILED  {source.name}: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -250,11 +265,11 @@ def main(argv: list[str] | None = None) -> int:
                 ensure_ascii=False,
             ))
         if args.qa:
-            qa_high_total += _report_qa(result.redacted_docx, files, source.name)
+            _print_qa(result.postcheck, source.name)
 
     if failures:
         return EXIT_PROCESSING_FAILED
-    if args.qa and qa_high_total:
+    if needs_review:
         return EXIT_QA_HIGH
     return EXIT_OK
 

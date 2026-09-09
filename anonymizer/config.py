@@ -41,6 +41,10 @@ class RuntimeConfig:
     azure_endpoint: str | None
     azure_deployment: str | None
     azure_api_version: str | None
+    # Bearer token every POST /anonymize request must present. Optional here
+    # because the CLI never needs it; the HTTP app refuses to start without it
+    # (see anonymizer.api.lifespan). Never logged, never returned in a response.
+    anon_api_key: str | None = None
     llm_timeout_s: float = 60.0
     chunk_size_chars: int = 3000
     max_completion_tokens: int = 2000
@@ -184,6 +188,11 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
         azure_deployment = _require(env, "ANON_AZURE_DEPLOYMENT", provider)
         azure_api_version = _require(env, "ANON_AZURE_API_VERSION", provider)
 
+    # API bearer key. Read for every provider; only the HTTP transport enforces
+    # it. An all-whitespace value counts as unset, so a blank line in .env can
+    # never become a usable credential.
+    api_key = (env.get("ANON_API_KEY") or "").strip() or None
+
     # Optional knobs: keep dataclass defaults when the variable is absent by
     # only supplying keys that were actually provided.
     overrides: dict[str, object] = {}
@@ -214,6 +223,7 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
         azure_endpoint=azure_endpoint,
         azure_deployment=azure_deployment,
         azure_api_version=azure_api_version,
+        anon_api_key=api_key,
         **overrides,  # type: ignore[arg-type]
     )
 

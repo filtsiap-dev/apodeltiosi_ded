@@ -1,5 +1,8 @@
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:  # import-cycle-free: postcheck imports docx_engine, which imports this module
+    from anonymizer.postcheck import PostcheckSummary
 
 
 @dataclass(frozen=True)
@@ -127,6 +130,11 @@ class AnonymizeResult:
     warnings: list[str]
     model: str
     timings: dict[str, float]
+    # Counts from the mandatory post-redaction scan of THIS output. A result
+    # only ever exists with zero HIGH findings — a HIGH raises ResidualPIIError
+    # instead — so this reports the lower-severity warnings that did not block
+    # the file.
+    postcheck: "PostcheckSummary | None" = None
     # Reproducibility stamp: which rules and prompts produced this output.
     # Keys: provider, model, config_sha256, prompts_sha256, package_version.
     provenance: dict[str, str] = field(default_factory=dict)

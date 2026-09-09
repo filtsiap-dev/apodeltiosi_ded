@@ -12,9 +12,11 @@ from anonymizer.docx_engine import (
     validate_docx_bytes,
     write_redacted_docx,
 )
+from anonymizer.errors import ResidualPIIError
 from anonymizer.llm.detector import run_llm_detection
 from anonymizer.llm.prompts import PROMPTS_SHA256
 from anonymizer.models import AnonymizeResult
+from anonymizer.postcheck import scan_redacted_docx_bytes
 from anonymizer.resolver import resolve_redactions
 from anonymizer.summary import build_summary
 
@@ -33,10 +35,19 @@ def anonymize_document(
 ) -> AnonymizeResult:
     """Transport-neutral anonymization pipeline over raw DOCX bytes.
 
-    Runs parse -> detect -> llm -> resolve -> apply, timing each stage, and
-    returns the redacted bytes plus a counts-only summary. Catches nothing;
-    every callee exception propagates. The only exception this function itself
-    raises is the invariant-1 RuntimeError below.
+    Runs parse -> detect -> llm -> resolve -> apply -> scan, timing each stage,
+    and returns the redacted bytes plus a counts-only summary.
+
+    The final scan is MANDATORY and there is no flag to skip it: every caller
+    (CLI and API alike) gets output that has been audited for residual personal
+    information. A HIGH-severity finding raises :class:`ResidualPIIError`, so no
+    such document is ever returned as a successful result — a result object can
+    only exist for a document that passed. Lower-severity findings do not block;
+    they ride along in ``result.postcheck`` and in ``result.warnings``.
+
+    Catches nothing; every callee exception propagates. The exceptions this
+    function itself raises are the invariant-1 RuntimeError below and
+    ResidualPIIError.
     """
     if document_id is None:
         document_id = uuid.uuid4().hex[:12]
@@ -110,6 +121,41 @@ def anonymize_document(
         timings["apply"],
     )
 
+    # Stage: scan — the mandatory post-redaction audit of the produced file.
+    # Runs on the bytes that are about to be handed back, after
+    # write_redacted_docx and before any caller can save or return them.
+    t0 = time.perf_counter()
+    postcheck = scan_redacted_docx_bytes(redacted, files)
+    timings["scan"] = time.perf_counter() - t0
+    high = postcheck.by_severity.get("HIGH", 0)
+    logger.info(
+        "stage=scan document_id=%s findings=%d high=%d by_kind=%s elapsed=%.3fs",
+        document_id,
+        postcheck.findings_total,
+        high,
+        postcheck.by_kind,
+        timings["scan"],
+    )
+    if high:
+        # Fail closed. The document is not returned and not saved: the leak has
+        # to be looked at by a person. Locations and kinds only — the finding
+        # details are not echoed, so the error text carries no document text.
+        locations = ", ".join(
+            f"{f.kind}@{f.location}" for f in postcheck.findings if f.severity == "HIGH"
+        )
+        raise ResidualPIIError(
+            f"post-redaction scan found {high} HIGH-severity finding(s); "
+            f"the document needs manual review ({locations})"
+        )
+
+    # Non-blocking findings travel with the result so a caller can surface them.
+    warnings = list(plan.warnings)
+    if postcheck.findings_total:
+        warnings.append(
+            f"post-redaction scan: {postcheck.findings_total} non-blocking "
+            f"finding(s) {postcheck.by_kind}"
+        )
+
     timings["total"] = time.perf_counter() - t_total
 
     # Reproducibility stamp: enough to answer "which rules, prompts, model and
@@ -132,8 +178,9 @@ def anonymize_document(
         document_id=document_id,
         redacted_docx=redacted,
         summary=build_summary(plan),
-        warnings=list(plan.warnings),
+        warnings=warnings,
         model=config.model_handle,
         timings=timings,
+        postcheck=postcheck,
         provenance=provenance,
     )

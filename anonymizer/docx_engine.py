@@ -29,17 +29,60 @@ XML_PARSER = etree.XMLParser(
     remove_blank_text=False,
 )
 
+# word/document.xml is the one part the whole pipeline depends on, so it is
+# parsed WITHOUT recovery: a malformed main document must be rejected, never
+# silently repaired into a document with no text. Other parts keep the
+# recovering parser above — a damaged header should not fail a usable file.
+STRICT_XML_PARSER = etree.XMLParser(
+    resolve_entities=False,
+    no_network=True,
+    recover=False,
+    remove_blank_text=False,
+)
+
 
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
+def _validate_main_document_xml(blob: bytes) -> None:
+    """Strictly parse ``word/document.xml`` and confirm it really is a Word document.
+
+    The ZIP-level checks above only prove that a member with the right NAME
+    exists. A file can carry every expected filename while its main document XML
+    is truncated, wrongly encoded, or not WordprocessingML at all — and the
+    recovering parser used for the rest of the package would turn that into an
+    empty document, i.e. an empty redaction plan and an "anonymized" file that
+    was never read. Rejecting it here is the whole point of this function.
+
+    Raises InvalidDocumentError when the XML does not parse, when its root is
+    not ``w:document``, or when it has no ``w:body``. Returns None.
+    """
+    try:
+        root = etree.fromstring(blob, parser=STRICT_XML_PARSER)
+    except etree.XMLSyntaxError as exc:
+        raise InvalidDocumentError(
+            f'word/document.xml is not valid XML: {exc}'
+        ) from exc
+
+    if root is None or root.tag != f'{{{W_NS}}}document':
+        found = getattr(root, 'tag', None)
+        raise InvalidDocumentError(
+            'word/document.xml is not a WordprocessingML document '
+            f'(root element is {found!r}, expected w:document)'
+        )
+
+    if root.find(f'{{{W_NS}}}body') is None:
+        raise InvalidDocumentError('word/document.xml has no w:body element')
+
+
 def validate_docx_bytes(data: bytes) -> None:
-    """Validate that ``data`` is a well-formed DOCX ZIP package containing the required parts. Raise InvalidDocumentError if it is not; return None."""
+    """Validate that ``data`` is a well-formed DOCX ZIP package containing the required parts, and that ``word/document.xml`` strictly parses as a Word document. Raise InvalidDocumentError if it is not; return None."""
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             names = set(zf.namelist())
             bad_member = zf.testzip()
+            main_document = zf.read('word/document.xml') if 'word/document.xml' in names else None
     except (zipfile.BadZipFile, OSError) as exc:
         raise InvalidDocumentError('Not a valid DOCX package') from exc
 
@@ -50,6 +93,9 @@ def validate_docx_bytes(data: bytes) -> None:
     missing = [name for name in required if name not in names]
     if missing:
         raise InvalidDocumentError('Not a valid DOCX package: missing ' + ', '.join(missing))
+
+    assert main_document is not None  # guaranteed by the missing-parts check above
+    _validate_main_document_xml(main_document)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +236,12 @@ def parse_docx(data: bytes, document_id: str) -> DocumentData:
         package_data = {info.filename: zin.read(info.filename) for info in zin.infolist()}
 
     parsed_parts = _parse_xml_parts(package_data)
+    if 'word/document.xml' not in parsed_parts:
+        # validate_docx_bytes just parsed this part strictly, so the recovering
+        # parser dropping it would mean the two disagree. Refuse rather than
+        # build an empty plan from a document nothing actually read.
+        raise InvalidDocumentError('word/document.xml could not be parsed')
+
     text_units: list[TextUnit] = []
     unit_counter = 0
 
