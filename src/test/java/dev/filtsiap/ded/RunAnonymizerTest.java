@@ -1,6 +1,7 @@
 package dev.filtsiap.ded;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -39,7 +40,10 @@ class RunAnonymizerTest {
         RunAnonymizer.ArgExit x = assertThrows(RunAnonymizer.ArgExit.class,
                 () -> RunAnonymizer.parseArgs(new String[] {"-h"}, o(), e()));
         assertEquals(0, x.code);
-        assertTrue(out.toString(StandardCharsets.UTF_8).startsWith("usage: run_anonymizer [-h] [--file FILE]"));
+        String help = out.toString(StandardCharsets.UTF_8);
+        assertTrue(help.startsWith("usage: run_anonymizer [-h] [--file FILE]"));
+        // Same line-break style throughout (CRLF on Windows, LF elsewhere), as Python prints it.
+        assertFalse(help.replace(System.lineSeparator(), "").contains("\n"));
     }
 
     @Test
@@ -47,7 +51,7 @@ class RunAnonymizerTest {
         RunAnonymizer.ArgExit x = assertThrows(RunAnonymizer.ArgExit.class,
                 () -> RunAnonymizer.parseArgs(new String[] {"a", "b"}, o(), e()));
         assertEquals(2, x.code);
-        assertTrue(err.toString(StandardCharsets.UTF_8).endsWith("run_anonymizer: error: unrecognized arguments: b\n"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).endsWith("run_anonymizer: error: unrecognized arguments: b" + System.lineSeparator()));
         assertEquals(2, RunAnonymizer.run(new String[] {"--file", "a.docx", "b.docx"}, o(), e()));
         assertEquals(2, RunAnonymizer.run(new String[] {}, o(), e()));
     }

@@ -87,8 +87,8 @@ final class ApiHandler implements HttpHandler {
     private static final class HttpError extends Exception {
         private static final long serialVersionUID = 1L;
         final int status;
-        final Object detail;
-        final Map<String, String> headers;
+        final transient Object detail;
+        final transient Map<String, String> headers;
 
         HttpError(int status, Object detail, Map<String, String> headers) {
             super(null, null, false, false);

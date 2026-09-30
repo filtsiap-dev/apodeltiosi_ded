@@ -145,7 +145,7 @@ public final class RunAnonymizer {
                                     + PyRepr.repr(inlineValue));
                         }
                         if (opt.equals("--help")) {
-                            out.print(HELP);
+                            out.print(platformLines(HELP));
                             throw new ArgExit(0);
                         }
                         if (opt.equals("--qa")) {
@@ -172,7 +172,7 @@ public final class RunAnonymizer {
                 continue;
             }
             if (!positionalOnly && tok.equals("-h")) {
-                out.print(HELP);
+                out.print(platformLines(HELP));
                 throw new ArgExit(0);
             }
             if (!positionalOnly && looksLikeOption(tok)) {
@@ -191,12 +191,17 @@ public final class RunAnonymizer {
         return new Args(input, file, outDir, configDir, qa, summaryJson);
     }
 
+    /** Python writes help text in text mode, so on Windows its line breaks are CRLF, like println's. */
+    static String platformLines(String text) {
+        return text.replace("\n", System.lineSeparator());
+    }
+
     private static boolean looksLikeOption(String tok) {
         return tok.startsWith("-") && tok.length() > 1 && !tok.matches("-\\d+(\\.\\d*)?|-\\.\\d+");
     }
 
     private static void usageError(PrintStream err, String message) throws ArgExit {
-        err.print(USAGE);
+        err.print(platformLines(USAGE));
         err.println(PROG + ": error: " + message);
         throw new ArgExit(EXIT_USAGE);
     }
