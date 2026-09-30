@@ -8,3 +8,5 @@ bad=[(r,x,y) for r,x,y in zip(req,a,b) if x!=y]
 print("mismatches:",len(bad), dict(Counter(r["op"] for r,_,_ in bad)))
 for r,x,y in bad[:int(sys.argv[4]) if len(sys.argv)>4 else 6]:
     print(json.dumps(r,ensure_ascii=False)[:300],"\n  py:",x[:300],"\n  jv:",y[:300])
+
+sys.exit(1 if bad else 0)

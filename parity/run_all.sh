@@ -18,16 +18,18 @@ run "detectors + resolver + summary: 300 documents"
 python3 tier_detect.py 300 && ./run_java.sh detect.jsonl detect.java.out && python3 compare.py detect.jsonl detect.py.out detect.java.out 3
 
 run "DOCX engine: 208 packages + invalid inputs (units, char maps, plans, output bytes)"
-python3 tier_docx.py 200 && ./run_java.sh docx.jsonl docx.java.out && python3 compare_docx.py | tail -1
+python3 tier_docx.py 200 && ./run_java.sh docx.jsonl docx.java.out && { python3 compare_docx.py > docx.cmp.txt && tail -1 docx.cmp.txt; } || { tail -20 docx.cmp.txt; exit 1; }
 
 run "post-redaction scan: inputs and redacted outputs"
 python3 tier_scan.py && ./run_java.sh scan.jsonl scan.java.out && python3 compare.py scan.jsonl scan.py.out scan.java.out 3
 
 run "damaged-part recovery: 400 mutated headers (informational; see CLAUDE.md O6)"
-python3 tier_recover.py && ./run_java.sh rec.jsonl rec.java.out && python3 compare.py rec.jsonl rec.py.out rec.java.out 0 | tail -1
+python3 tier_recover.py && ./run_java.sh rec.jsonl rec.java.out && { python3 compare.py rec.jsonl rec.py.out rec.java.out 0 | tail -1 || true; }
 
 run "end-to-end pipeline with recorded LLM responses: 150 documents"
 python3 tier_pipeline.py 150 && ./run_java.sh pipe.jsonl pipe.java.out 2>/dev/null && python3 compare.py pipe.jsonl pipe.py.out pipe.java.out 3
 
 run "HTTP API over the wire: FastAPI/uvicorn vs Java HttpServer"
-python3 api_live.py | tail -3
+{ python3 api_live.py > api.cmp.txt && tail -3 api.cmp.txt; } || { tail -20 api.cmp.txt; exit 1; }
+
+echo "== all tiers passed"

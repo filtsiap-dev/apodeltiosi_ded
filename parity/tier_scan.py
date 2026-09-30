@@ -9,7 +9,7 @@ from pin_python_order import load_file_config
 from anonymizer.postcheck import scan_redacted_docx_bytes
 from anonymizer.errors import AnonymizerError
 cfg = load_file_config(Path(REPO) / "config")
-paths = sorted(glob.glob("docx/in*.docx")) 
+paths = sorted(glob.glob("docx/in*.docx"))
 paths = [p for p in paths if ".out." not in p] + sorted(glob.glob("docx/*.py.out.docx"))
 with open("scan.jsonl","w") as f:
     for p in paths: f.write(json.dumps({"op":"scan","path":p})+"\n")

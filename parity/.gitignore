@@ -6,3 +6,4 @@ __pycache__/
 *.out
 api_recording.json
 rec.kinds.json
+*.cmp.txt

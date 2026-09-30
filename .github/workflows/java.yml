@@ -1,0 +1,46 @@
+# Java port: build, unit tests, and differential verification against the Python implementation
+# (CLAUDE.md §7). All parity inputs are synthetic.
+name: java
+
+on:
+  push:
+    branches: [java]
+  pull_request:
+    branches: [java]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Build and run JUnit tests
+        run: mvn -B verify
+
+  parity:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Python reference implementation
+        # httpx<0.28: Starlette 0.27's TestClient/uvicorn stack pinned by requirements.txt.
+        run: pip install -r requirements.txt "httpx<0.28"
+      - name: Java build and classpath
+        run: |
+          mvn -B -q package -DskipTests
+          mvn -B -q dependency:build-classpath -Dmdep.outputFile=target/cp.txt
+      - name: Differential verification (Python vs Java)
+        run: parity/run_all.sh

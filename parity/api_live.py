@@ -95,6 +95,8 @@ def norm(status, h, body):
     if "content-disposition" in keep: keep["content-disposition"] = re.sub(r'filename="[0-9a-f]{12}_', 'filename="ID_', keep["content-disposition"])
     if keep.get("content-type", "").startswith("application/vnd.openxml"): return status, keep, docx_parts(body)
     if keep.get("content-type") == "application/json" and body:
+        # Pydantic is not pinned by requirements.txt; its 422 body names its own version.
+        body = re.sub(rb"errors\.pydantic\.dev/[0-9.]+/", b"errors.pydantic.dev/X/", body)
         j = json.loads(body)
         if isinstance(j, dict) and "docx_base64" in j:
             j["docx_base64"] = docx_parts(base64.b64decode(j["docx_base64"])); j["document_id"] = "ID"
@@ -110,3 +112,6 @@ for c, a, b in zip(cases, py, jv):
     else:
         print("DIFF", c[0], c[1], {k: v for k, v in c[2].items()}, "\n  py:", str(na)[:300], "\n  jv:", str(nb)[:300])
 print(f"cases: {len(cases)}  identical: {same}  python statuses: {dict(sorted(statuses.items()))}")
+# One documented deviation (CLAUDE.md §8, deviation 7): "Bearer<TAB>key", normalized by the JDK header parser.
+KNOWN = sum(1 for c in cases if "\t" in (c[2].get("Authorization") or ""))
+sys.exit(0 if same >= len(cases) - KNOWN else 1)

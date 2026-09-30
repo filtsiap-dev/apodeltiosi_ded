@@ -27,8 +27,9 @@ When a Python file changes:
    the generated files (`DetectorPatterns`, `PostcheckPatterns`, `llm/PromptText`, `IbanRegistry`).
 2. Port the logic change into the Java class listed in §6, following §3–§5.
 3. Record any new decision or deviation in §8 **before** moving on.
-4. `mvn package`, then `parity/run_all.sh` (§7). Every tier must stay at 0 mismatches except the
-   informational recovery tier and the documented API case.
+4. `mvn verify` (build + JUnit), then `parity/run_all.sh` (§7). The script exits non-zero on any
+   mismatch, except in the informational recovery tier and the one documented API case. CI
+   (`.github/workflows/java.yml`) runs both on every push and pull request to `java`.
 5. Update §6 and §7 figures if they changed.
 
 ---
@@ -155,6 +156,8 @@ hash-seed-dependent set order is pinned to Java's order first (`pin_python_order
 | HTTP API | 43 raw HTTP requests to uvicorn/FastAPI and to the Java server | status, relevant headers, JSON bodies, DOCX parts | 42/43 (deviation 7) |
 
 DOCX outputs are compared per part, never as raw ZIP bytes (compression differs by design).
+Python-side pins that matter for byte parity: lxml 5.4.0, python-stdnum 2.2, FastAPI 0.104.1 /
+Starlette 0.27 / python-multipart 0.0.32 (`requirements.txt`; the API tier also needs `httpx<0.28`).
 
 ---
 
@@ -163,7 +166,7 @@ DOCX outputs are compared per part, never as raw ZIP bytes (compression differs 
 **Decided**
 - D1. Repo `filtsiap-dev/apodeltiosi_ded`, branch `java`.
 - D2. Redaction one-way, length-preserving (`"."` per code point).
-- D3. Python `tests/` set aside; the differential harness is the verification. JUnit tests not yet written.
+- D3. Python `tests/` stay git-ignored and are not ported. Java verification = the differential harness (§7) plus JUnit tests in `src/test/java` (66 tests, synthetic data, no Python needed): Python-semantics traps, fail-closed contracts, error paths of every component, CLI parsing, HTTP contract on an ephemeral port.
 - D4. Maven, single module, standard layout; `config/` at repo root.
 - D5. JDK 21.
 - D6. Jackson 2.x (`com.fasterxml`, BOM-pinned to the line openai-java uses), never Jackson 3. Used only by `PyJson.loads` (LLM output, configured for Python `json.loads` leniency: NaN/Infinity, duplicate keys last-wins, big numbers); serialization is `PyJson`'s own writer.
@@ -199,8 +202,17 @@ DOCX outputs are compared per part, never as raw ZIP bytes (compression differs 
 
 **Open**
 - O6. Policy for non-well-formed Word text parts. Now: recover (libxml2 emulation, parity-oriented). In the 400-case fuzz Java extracts more text than Python in 28 differing cases and less in 9, where 1–2 characters can end up inside a tag name (e.g. a 9-digit AFM leaving a 7-digit fragment). Python has its own leak here: a deleted `>` can close a paragraph early, leaving runs outside any `w:p` that are neither redacted nor scanned. Word never writes such XML. **Recommendation**: reject non-well-formed must-parse parts in both implementations. Decide, then change Python and Java together.
-- O7. Upstream Python fixes recommended by the port: sort the medical terms and allowlist ties (prompt reproducibility, D12); fail closed on unparseable must-parse parts (D19); O6.
-- O8. JUnit tests (D3) and CI wiring of `parity/run_all.sh`.
+- O7. Upstream Python fixes found by the port:
+  1. Sort the medical terms and allowlist ties (prompt reproducibility, D12).
+  2. Fail closed on unparseable must-parse parts (D19; removes deviation 4).
+  3. **Scan's AMKA rule reads the wrong digits.** `qa_patterns["AMKA"]` checks the first six
+     digits as YYMMDD; an AMKA starts with DDMMYY (as `detectors` validates). Digits 5–6 (birth
+     year) must then look like a day 01–31, so a surviving AMKA of anyone born 1932–1999 gives
+     only a MEDIUM `digit_run`, never the blocking HIGH. Verified on the Python code. Java mirrors
+     it (parity). Date-valid AMKAs are hard-redacted upstream, so the gap bites when a soft AMKA
+     (label present, impossible date) or an LLM decision lets one through.
+  4. O6.
+- O8. Done: JUnit suite (D3) and CI (`.github/workflows/java.yml`: `mvn verify`, then the harness).
 
 ---
 

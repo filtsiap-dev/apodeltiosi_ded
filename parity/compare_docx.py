@@ -1,4 +1,4 @@
-import json, zipfile, io
+import json, zipfile, io, sys
 from lxml import etree
 reqs=[json.loads(l) for l in open("docx.jsonl")]
 a=[json.loads(l) for l in open("docx.py.out",encoding="utf-8").read().split("\n") if l]
@@ -25,3 +25,4 @@ for r,x,y in zip(reqs,a,b):
                 outbad+=1; print(r["path"], i.filename, "C14N differ\n  py:", dp[:400], "\n  jv:", dj[:400]); break
         elif dp!=dj: outbad+=1; print(r["path"], i.filename, "bytes differ"); break
 print("docs:",len(reqs),"parse/plan mismatches:",bad,"output mismatches:",outbad)
+sys.exit(1 if (bad or outbad) else 0)
