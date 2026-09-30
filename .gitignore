@@ -19,3 +19,6 @@ skill_analysis_reusable_patterns.md
 
 # Tests — not tracked.
 tests/
+
+# Java build output (Maven).
+target/

@@ -1,0 +1,8 @@
+docx/
+pipe/
+java/classes/
+__pycache__/
+*.jsonl
+*.out
+api_recording.json
+rec.kinds.json
