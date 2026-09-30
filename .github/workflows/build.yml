@@ -1,0 +1,21 @@
+# Build and unit tests (JUnit, synthetic data only).
+name: build
+
+on:
+  push:
+    branches: [java-app]
+  pull_request:
+    branches: [java-app]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Build and run JUnit tests
+        run: mvn -B verify

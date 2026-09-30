@@ -1,0 +1,31 @@
+policy:
+  preserve_high_confidence_threshold: 0.8
+  redact_high_confidence_threshold: 0.9
+  redact_threshold: 0.7
+
+  # Hard preserves: even at low confidence, never redact these categories
+  hard_preserve_categories:
+    - DATE
+    - DOU
+    - PUBLIC_SERVICE
+    - LEGAL_REF
+    - MONEY
+    - TAX_YEAR
+    - ARTICLE_REF
+    - COURT_DECISION
+    - PUBLIC_AUTHORITY_HEADER
+    - DECISION_METADATA
+    - OFFICIAL_SIGNATORY
+    - PERCENTAGE
+    - FISCAL_PERIOD
+
+  # Hard redacts: if seen with confidence >= 0.9, no preserve can shield them
+  hard_redact_categories:
+    - AFM
+    - AMKA
+    - IBAN
+    - EMAIL
+
+  preserve_email_domains:
+    - aade.gr
+    - gov.gr

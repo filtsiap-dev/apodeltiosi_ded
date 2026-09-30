@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- CLI profile (run_anonymizer): bare messages on stderr; root WARN, pipeline and LLM progress at INFO. -->
+<configuration>
+  <appender name="STDERR" class="ch.qos.logback.core.ConsoleAppender">
+    <target>System.err</target>
+    <encoder><pattern>%msg%n</pattern><charset>UTF-8</charset></encoder>
+  </appender>
+  <logger name="anonymizer.pipeline" level="INFO"/>
+  <logger name="anonymizer.llm.detector" level="INFO"/>
+  <root level="WARN"><appender-ref ref="STDERR"/></root>
+</configuration>

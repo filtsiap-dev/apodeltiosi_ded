@@ -1,0 +1,10 @@
+# Maven build output.
+target/
+
+# Never commit real secrets.
+.env
+
+# IDEs.
+.idea/
+*.iml
+.vscode/
