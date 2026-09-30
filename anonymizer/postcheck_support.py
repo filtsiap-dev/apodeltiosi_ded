@@ -9,7 +9,8 @@ import re
 
 qa_patterns = {
     "AFM": re.compile(r"\b(\d{9})\b"),
-    "AMKA": re.compile(r"\b(\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{5})\b"),
+    # An AMKA starts with the holder's birth date as DDMMYY (the same reading detectors use).
+    "AMKA": re.compile(r"\b((0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])\d{2}\d{5})\b"),
     "IBAN_GR": re.compile(r"\bGR\d{2}\d{7}\d{16}\b", re.IGNORECASE),
     "EMAIL": re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"),
     "PHONE": re.compile(r"(?<!\d)(?:\+?30|0030)?[\s\-]?(?:69|2\d)[\d\s\-]{8,14}(?!\d)"),

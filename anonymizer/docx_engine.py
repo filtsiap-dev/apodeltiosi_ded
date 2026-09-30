@@ -117,6 +117,21 @@ def _parse_xml_parts(package_data: dict[str, bytes]) -> dict[str, etree._Element
     return parsed
 
 
+# Parts that redaction or metadata cleanup must rewrite. A present-but-unparseable one would
+# otherwise be copied through verbatim, text and metadata unredacted, and the post-redaction
+# scan cannot read it either: refuse the document instead (fail closed).
+_MUST_PARSE_PARTS = ('word/comments.xml', 'docProps/core.xml', 'docProps/app.xml')
+
+
+def _require_parsed(package_data: dict[str, bytes], parsed: dict[str, etree._Element]) -> None:
+    """Raise InvalidDocumentError when a part that must be rewritten could not be parsed."""
+    for name in package_data:
+        if (_is_word_text_part(name) or name in _MUST_PARSE_PARTS) and name not in parsed:
+            raise InvalidDocumentError(
+                f'part could not be parsed and cannot be safely redacted: {name}'
+            )
+
+
 def _serialize_xml(root: etree._Element) -> bytes:
     """Serialize an lxml root element to UTF-8 bytes with an XML declaration."""
     return etree.tostring(root, encoding='UTF-8', xml_declaration=True)
@@ -241,6 +256,7 @@ def parse_docx(data: bytes, document_id: str) -> DocumentData:
         # parser dropping it would mean the two disagree. Refuse rather than
         # build an empty plan from a document nothing actually read.
         raise InvalidDocumentError('word/document.xml could not be parsed')
+    _require_parsed(package_data, parsed_parts)
 
     text_units: list[TextUnit] = []
     unit_counter = 0
@@ -604,6 +620,7 @@ def write_redacted_docx(input_bytes: bytes, document: DocumentData, plan: Redact
 
         stage = 'parse'
         parsed_parts = _parse_xml_parts(package_data)
+        _require_parsed(package_data, parsed_parts)
 
         stage = 'apply_plan'
         apply_plan(parsed_parts, document, plan)

@@ -103,7 +103,7 @@ replaces one code point with one `"."`.
   3. Deterministic REDACT spans stay in the plan whatever pass 2 says.
   4. Post-redaction scan: any HIGH finding → `ResidualPIIError`, no output.
   5. HTTP service refuses to start without `ANON_API_KEY`; constant-time compare; auth before body read.
-  6. **(Java addition, D19)** a Word text part, `word/comments.xml`, `docProps/core.xml` or
+  6. **(D19)** a Word text part, `word/comments.xml`, `docProps/core.xml` or
      `docProps/app.xml` that cannot be parsed even by recovery rejects the document instead of
      being copied verbatim.
 
@@ -175,20 +175,20 @@ Starlette 0.27 / python-multipart 0.0.32 (`requirements.txt`; the API tier also 
 - D9. Regex via the `PyRegex` translator (§5.1), replacing the earlier "UNICODE_CHARACTER_CLASS" idea, which differs from Python for `\d`, `\s`, `\b`.
 - D10. ZIP via Commons Compress: central-directory order, CP437 names unless the UTF-8 flag is set, duplicate names resolve to the last entry, every CRC verified (as `testzip`); written entries copy name, time, method, attributes, extra fields.
 - D11. XML: JDK DOM strict (namespace-aware, coalescing, entity refs not expanded, no external entities/DTDs). Recovery = jsoup XML parser plus libxml2 rules (truncated tag, malformed/undefined references, invalid `<`, `<` inside tag names) and an own jsoup→DOM converter that never throws. lxml text/tail and child indexing emulated in `LxmlDom`; attribute order recorded with StAX so serialization is byte-identical to lxml.
-- D12. Where Python iterates a set into output (medical terms; equal-length allowlist entries), Java sorts by code point. Python's order depends on `PYTHONHASHSEED`, so Python itself is not reproducible there.
+- D12. Where Python iterated a set into output (medical terms; equal-length allowlist entries), both implementations now sort by code point (Python since O7.1; before that its order depended on `PYTHONHASHSEED` and reached the LLM prompts). `parity/pin_python_order.py` is kept so older Python revisions can still be compared; on current code it changes nothing.
 - D13. HTTP on JDK `HttpServer`, one virtual thread per request; FastAPI contract reproduced (routing 404/405/307, `{"detail"}` vs `{"error","detail"}`, exact-class status map, Pydantic lax int for `summary`, 422 body, multipart per Starlette 0.27: last `file` wins, `filename` param marks a file part).
 - D14. IBAN: native port of `stdnum.iban.is_valid` (mod 97, BBAN structure from generated registry of 89 countries, BE/ES/ME/NO national checks).
 - D15. `LlmClient` seam; `OpenAiLlmClient` over openai-java (per-phase timeouts like httpx, 2 SDK retries, Azure legacy URL mode); `OPENAI_BASE_URL`, `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID` honoured as the Python SDK does. Exception classes map in Python's order (timeout → `AITimeoutError`, connection → `AIUnavailableError`, HTTP status / other → `AIProviderError`).
 - D16. Regex constants, prompt text and the IBAN registry are generated from the live Python modules (`tools/gen_constants.py`).
 - D17. Logging: CLI prints bare messages on stderr (root WARN; pipeline and LLM progress INFO); API logs `LEVEL:logger:message` on stdout at `ANON_LOG_LEVEL` (Python level names; unknown names fail startup).
 - D18. "Next to the script" = app home: `-Danonymizer.home`, else the JAR's directory or its parent if it has `config/`, else the working directory. The API keeps Python's cwd-relative `config/`.
-- D19. Fail closed on unparseable must-parse parts (§5.4 contract 6).
+- D19. Fail closed on unparseable must-parse parts (§5.4 contract 6), in both implementations since O7.2.
 
 **Deviations from Python (deliberate, all documented)**
 1. Unsupported compression / unreadable member → 400 `InvalidDocumentError` (Python: uncaught → 500).
 2. XML syntax-error `detail` wording after the common prefix differs (Xerces vs libxml2 messages).
 3. Malformed config values (non-mapping YAML, non-numeric thresholds) → `ConfigurationError` (Python: uncaught exception).
-4. Must-parse part unrecoverable → rejected (Python copies it verbatim, a latent leak).
+4. ~~Must-parse part unrecoverable → rejected (Python copied it verbatim).~~ Resolved by O7.2: Python rejects too.
 5. Damaged-part recovery approximates libxml2 (O6).
 6. Provider response with no `choices` → `AIProviderError` "empty completion" (Python: `IndexError` → 500).
 7. `Authorization: Bearer<TAB>key` is accepted: the JDK header parser turns the tab into a space (Python: 401). Still requires the correct key.
@@ -202,16 +202,16 @@ Starlette 0.27 / python-multipart 0.0.32 (`requirements.txt`; the API tier also 
 
 **Open**
 - O6. Policy for non-well-formed Word text parts. Now: recover (libxml2 emulation, parity-oriented). In the 400-case fuzz Java extracts more text than Python in 28 differing cases and less in 9, where 1–2 characters can end up inside a tag name (e.g. a 9-digit AFM leaving a 7-digit fragment). Python has its own leak here: a deleted `>` can close a paragraph early, leaving runs outside any `w:p` that are neither redacted nor scanned. Word never writes such XML. **Recommendation**: reject non-well-formed must-parse parts in both implementations. Decide, then change Python and Java together.
-- O7. Upstream Python fixes found by the port:
-  1. Sort the medical terms and allowlist ties (prompt reproducibility, D12).
-  2. Fail closed on unparseable must-parse parts (D19; removes deviation 4).
-  3. **Scan's AMKA rule reads the wrong digits.** `qa_patterns["AMKA"]` checks the first six
-     digits as YYMMDD; an AMKA starts with DDMMYY (as `detectors` validates). Digits 5–6 (birth
-     year) must then look like a day 01–31, so a surviving AMKA of anyone born 1932–1999 gives
-     only a MEDIUM `digit_run`, never the blocking HIGH. Verified on the Python code. Java mirrors
-     it (parity). Date-valid AMKAs are hard-redacted upstream, so the gap bites when a soft AMKA
-     (label present, impossible date) or an LLM decision lets one through.
-  4. O6.
+- O7. Upstream Python fixes found by the port — **1–3 done** (Python and Java changed together,
+  parity unchanged):
+  1. Done: medical terms and allowlist ties sorted (prompt reproducibility, D12).
+  2. Done: unparseable must-parse parts rejected (D19; removed deviation 4).
+  3. Done: the scan's AMKA rule read the first six digits as YYMMDD, but an AMKA starts with
+     DDMMYY (as `detectors` validates), so a surviving AMKA of anyone born 1932–1999 gave only a
+     MEDIUM `digit_run`, never the blocking HIGH. Now DDMMYY in `postcheck_support.qa_patterns`
+     (Java regenerated). In the pipeline tier this blocks 2 more synthetic documents out of 150,
+     identically in both implementations.
+  4. Open: O6.
 - O8. Done: JUnit suite (D3) and CI (`.github/workflows/java.yml`: `mvn verify`, then the harness).
 
 ---

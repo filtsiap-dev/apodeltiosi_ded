@@ -20,6 +20,15 @@ class PostcheckTest {
     }
 
     @Test
+    void residualAmkaIsHighWhateverTheBirthYear() {
+        // DDMMYY: born 15/07/1985 and 03/11/1999. Before O7.3 the scan read YYMMDD and missed both.
+        for (String amka : new String[] {"15078512345", "03119912345", "20040512345"}) {
+            PostcheckSummary s = Postcheck.scanRedactedDocxBytes(TestDocx.paragraphs("ΑΜΚΑ " + amka).bytes(), FILES);
+            assertEquals(1, s.byKind().get("residual_amka"), amka);
+        }
+    }
+
+    @Test
     void detailsNeverEchoMatchedPii() {
         String afm = TestDocx.validAfm("87654321");
         byte[] docx = TestDocx.paragraphs("ΑΦΜ " + afm, "email x.y@example.com").bytes();

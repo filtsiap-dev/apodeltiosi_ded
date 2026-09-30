@@ -343,7 +343,7 @@ def _detect_dou(unit: TextUnit, rules: DetectorRules) -> list[Span]:
         value_start = prefix_match.end()
         suffix = text[value_start:]
         matched_entry = None
-        for entry in sorted(rules.dou_allowlist, key=len, reverse=True):
+        for entry in sorted(sorted(rules.dou_allowlist), key=len, reverse=True):
             if re.match(re.escape(entry) + r"\b", suffix, re.IGNORECASE):
                 matched_entry = entry
                 break
@@ -796,7 +796,7 @@ def detect_review_candidates(unit: TextUnit) -> list[Span]:
             flags=0,  # case-sensitive: the trigger lists both οδός/Οδός on purpose
         )
     )
-    for term in _MEDICAL_TERMS:
+    for term in sorted(_MEDICAL_TERMS):  # sorted: set order depends on the hash seed
         for match in re.finditer(re.escape(term), unit.normalized_text, re.IGNORECASE):
             spans.append(
                 _make_span(

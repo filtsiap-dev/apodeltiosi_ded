@@ -82,7 +82,9 @@ def _iter_allowlist_matches(text: str, entries):
     shorter prefix of it. This is how deterministic PRESERVE locates known
     public-service / legal-reference names in a text unit.
     """
-    for entry in sorted(entries, key=len, reverse=True):
+    # Longest first; equal lengths in code-point order, so the result does not depend on the
+    # hash seed (set iteration order would otherwise reach detector output and the LLM prompt).
+    for entry in sorted(sorted(entries), key=len, reverse=True):
         if not entry:
             continue
         yield from re.finditer(re.escape(entry), text, re.IGNORECASE)

@@ -16,7 +16,7 @@ final class PostcheckPatterns {
     static {
         Map<String, PyPattern> qa = new LinkedHashMap<>();
         qa.put("AFM", PyRegex.compile("\\b(\\d{9})\\b", 0));
-        qa.put("AMKA", PyRegex.compile("\\b(\\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])\\d{5})\\b", 0));
+        qa.put("AMKA", PyRegex.compile("\\b((0[1-9]|[12]\\d|3[01])(0[1-9]|1[0-2])\\d{2}\\d{5})\\b", 0));
         qa.put("IBAN_GR", PyRegex.compile("\\bGR\\d{2}\\d{7}\\d{16}\\b", PyRegex.IGNORECASE));
         qa.put("EMAIL", PyRegex.compile("[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}", 0));
         qa.put("PHONE", PyRegex.compile("(?<!\\d)(?:\\+?30|0030)?[\\s\\-]?(?:69|2\\d)[\\d\\s\\-]{8,14}(?!\\d)", 0));
