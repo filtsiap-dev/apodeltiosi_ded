@@ -13,10 +13,11 @@ DetectorRules`` parameter.
 from __future__ import annotations
 
 import re
+from typing import Callable
 from datetime import date
 
 from anonymizer.config import DetectorRules
-from anonymizer.models import Span, TextUnit
+from anonymizer.models import Span, SpanAction, SpanCategory, TextUnit
 
 # Re-exported constants owned by Task 04A. Inferred from the v1 monolith;
 # this block MUST mirror detector_patterns' actual exports/__all__ exactly —
@@ -34,7 +35,6 @@ from anonymizer.detector_patterns import (
     _FATHER_NAME_RE,
     _PRIVATE_ADDRESS_RE,
     _BUSINESS_SEAT_RE,
-    _COMPANY_WORD,
     _COMPANY_NAME_AFTER_CTX,
     _BANK_ACCOUNT_RE,
     _BENEFICIARY_RE,
@@ -49,12 +49,24 @@ from anonymizer.detector_patterns import (
     _DECISION_TITLE_RE,
     _DECISION_NUMBER_RE,
     _DECISION_PLACE_DATE_RE,
+    _RESIDENT_CUE,
+    _ADDRESS_NUMBER_RE,
+    _POSTAL_CODE_RE,
+    _LOCALITY_AUTHORITY_RE,
+    _LOCALITY_CONTEXT_RE,
+    _CASE_COURT_SERIAL_RE,
+    _COURT_CHAMBER_RE,
+    _PROCEDURAL_DATE_CUE_RE,
+    _PROCEDURAL_DATE_WINDOW,
 )
 
 # Optional dependency guard: primary IBAN validation uses python-stdnum when
 # available, with a self-contained mod-97 fallback otherwise.
+_stdnum_iban_is_valid: Callable[[str], bool] | None
 try:
-    from stdnum.iban import is_valid as _stdnum_iban_is_valid
+    from stdnum.iban import is_valid as _stdnum_iban_imported
+
+    _stdnum_iban_is_valid = _stdnum_iban_imported
 except Exception:  # pragma: no cover - dependency fallback
     _stdnum_iban_is_valid = None
 
@@ -96,10 +108,10 @@ def _make_span(
     unit: TextUnit,
     start: int,
     end: int,
-    category: str,
+    category: SpanCategory,
     detector: str,
     confidence: float,
-    action: str,
+    action: SpanAction,
     reason: str,
 ) -> Span:
     """Build a ``Span`` over ``unit.normalized_text[start:end]`` with the given category, detector, confidence, action, and reason."""
@@ -119,10 +131,10 @@ def _make_span(
 def _regex_spans(
     unit: TextUnit,
     regex: str | re.Pattern[str],
-    category: str,
+    category: SpanCategory,
     detector: str,
     confidence: float,
-    action: str,
+    action: SpanAction,
     reason: str,
     flags: int = re.IGNORECASE,
 ) -> list[Span]:
@@ -141,10 +153,10 @@ def _capture_spans(
     unit: TextUnit,
     pattern: str | re.Pattern[str],
     group: int,
-    category: str,
+    category: SpanCategory,
     detector: str,
     confidence: float,
-    action: str,
+    action: SpanAction,
     reason: str,
     flags: int = re.IGNORECASE,
 ) -> list[Span]:
@@ -227,6 +239,31 @@ def _split_serial_date(value: str):
     return None
 
 
+_YEAR_SUFFIX_RE = re.compile(r"^(.*?\S)\s*/\s*((?:19|20)\d{2})$")
+
+
+def _split_year_suffix(value: str):
+    """Return ``(serial, year)`` when ``value`` ends in a bare ``/YYYY``, else None.
+
+    The sibling of :func:`_split_serial_date`, which only peels a trailing FULL
+    date (``/14-10-2024``). A ΔΕΔ reference just as often ends in the year alone
+    (``34519/2026``), and the gold keeps that year visible while blanking the
+    serial — so without this the year is redacted as part of the identifier.
+
+    Whitespace around the separator is tolerated because the documents contain
+    it: ΓΕΩΡΓΟΠΟΥΛΟΥ ¶32 reads ``υπ’ αριθ. 193660 /13-07-2021``.
+
+    DELIBERATELY NOT APPLIED EVERYWHERE. Only the detectors whose ΔΕΔ convention
+    calls for it use this; "anything ending in /YYYY keeps its year" is not a
+    safe global rule, since another identifier may carry the year as an
+    integral component.
+    """
+    match = _YEAR_SUFFIX_RE.match(value.strip())
+    if match:
+        return match.group(1), match.group(2)
+    return None
+
+
 def _normalize_header(value: str) -> str:
     """Return ``value`` with whitespace collapsed to single spaces and casefolded, for table-header comparison."""
     return " ".join(value.split()).casefold()
@@ -245,7 +282,6 @@ __all__ = [
     "_FATHER_NAME_RE",
     "_PRIVATE_ADDRESS_RE",
     "_BUSINESS_SEAT_RE",
-    "_COMPANY_WORD",
     "_COMPANY_NAME_AFTER_CTX",
     "_BANK_ACCOUNT_RE",
     "_BENEFICIARY_RE",
@@ -260,6 +296,15 @@ __all__ = [
     "_DECISION_TITLE_RE",
     "_DECISION_NUMBER_RE",
     "_DECISION_PLACE_DATE_RE",
+    "_RESIDENT_CUE",
+    "_ADDRESS_NUMBER_RE",
+    "_POSTAL_CODE_RE",
+    "_LOCALITY_AUTHORITY_RE",
+    "_LOCALITY_CONTEXT_RE",
+    "_CASE_COURT_SERIAL_RE",
+    "_COURT_CHAMBER_RE",
+    "_PROCEDURAL_DATE_CUE_RE",
+    "_PROCEDURAL_DATE_WINDOW",
     # Support helpers owned by this module
     "_body",
     "_prefix",
@@ -271,5 +316,6 @@ __all__ = [
     "_valid_amka_birth_date",
     "_iban_is_valid",
     "_split_serial_date",
+    "_split_year_suffix",
     "_normalize_header",
 ]

@@ -8,6 +8,13 @@ version = "2.0.0"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi",
+    # Named directly by this project, not merely pulled in underneath fastapi:
+    # anonymizer/api.py imports anyio.from_thread, and anonymizer/upload.py
+    # types its parameter as starlette.requests.Request. A dependency a module
+    # names is a dependency the project has, whether or not something else
+    # happens to install it today.
+    "anyio",
+    "starlette",
     "uvicorn",
     "gunicorn",
     "uvicorn-worker",
@@ -18,9 +25,35 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff", "mypy", "httpx"]
+# Development only. The two stub packages type third-party libraries this
+# project imports; neither has any runtime effect, so neither belongs in the
+# dependency list above or in requirements.txt.
+dev = [
+    "pytest",
+    "ruff",
+    "mypy",
+    "httpx",
+    "types-PyYAML",
+    "lxml-stubs",
+]
 
 # config/ is runtime data (yaml + allowlists), not an importable package — restrict
 # discovery to the anonymizer package (and its llm subpackage) only.
 [tool.setuptools.packages.find]
 include = ["anonymizer*"]
+
+# Type checking. Not CI configuration — there is no CI in this repository — but
+# the settings a developer running `mypy` should get without having to remember
+# them.
+[tool.mypy]
+python_version = "3.11"
+files = ["anonymizer", "run_anonymizer.py", "examples", "gunicorn.conf.py"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+# Third-party libraries whose stubs are optional (declared in the dev extra) or
+# unavailable. Scoped per module rather than globally: a missing stub for lxml
+# must not silence a missing import anywhere else.
+[[tool.mypy.overrides]]
+module = ["lxml.*", "yaml", "stdnum.*"]
+ignore_missing_imports = true

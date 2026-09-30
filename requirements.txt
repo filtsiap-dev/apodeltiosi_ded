@@ -1,12 +1,17 @@
-# Runtime dependencies — keep in sync with [project.dependencies] in pyproject.toml.
+# Runtime dependencies, PINNED to the versions this project was tested with.
+# pyproject.toml keeps the abstract (unversioned) list; this file is the lock
+# used for reproducible installs.
 # Install with: pip install -r requirements.txt
-# (pip install -e . is the alternative that also registers the anonymizer package
-# itself as editable and reads this same list from pyproject.toml.)
-fastapi
-uvicorn
-gunicorn
-uvicorn-worker
-openai
-lxml
-pyyaml
-python-stdnum
+fastapi==0.104.1
+# Both are named directly by the application (anyio.from_thread in the API,
+# starlette.requests.Request in the upload reader), so both are pinned here
+# rather than left to whatever fastapi resolves to.
+starlette==0.27.0
+anyio==3.7.1
+uvicorn==0.51.0
+gunicorn==26.0.0
+uvicorn-worker==0.4.0
+openai==2.36.0
+lxml==5.4.0
+PyYAML==6.0.2
+python-stdnum==2.2

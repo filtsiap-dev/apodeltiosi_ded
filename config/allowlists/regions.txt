@@ -1,0 +1,59 @@
+# Greek administrative REGIONS and prefectures.
+#
+# These stay visible. The gold blanks the municipality but keeps the region:
+# "κατοίκου Χαλανδρίου Αττικής" -> "κατοίκου …………. Αττικής" (ΣΚΟΥΛΑ ¶28).
+# A region names an area of millions of people and identifies nobody, so the
+# private-address detector trims a trailing entry from this list off its
+# capture rather than redacting it.
+#
+# One entry per line; blank lines and lines starting with # are ignored.
+# Matching is case-insensitive and applies to the LAST word(s) of the capture.
+Αττικής
+Αττική
+Θεσσαλονίκης
+Θεσσαλονίκη
+Στερεάς Ελλάδας
+Κεντρικής Μακεδονίας
+Δυτικής Μακεδονίας
+Ανατολικής Μακεδονίας και Θράκης
+Ηπείρου
+Θεσσαλίας
+Ιονίων Νήσων
+Δυτικής Ελλάδας
+Πελοποννήσου
+Βορείου Αιγαίου
+Νοτίου Αιγαίου
+Κρήτης
+Εύβοιας
+Ευβοίας
+Αχαΐας
+Μαγνησίας
+Λάρισας
+Λαρίσης
+Κορινθίας
+Αρκαδίας
+Μεσσηνίας
+Λακωνίας
+Ηλείας
+Βοιωτίας
+Φθιώτιδας
+Φωκίδας
+Ευρυτανίας
+Αιτωλοακαρνανίας
+Άρτας
+Πρέβεζας
+Θεσπρωτίας
+Ιωαννίνων
+Τρικάλων
+Καρδίτσας
+Πιερίας
+Ημαθίας
+Πέλλας
+Κιλκίς
+Σερρών
+Χαλκιδικής
+Δράμας
+Καβάλας
+Ξάνθης
+Ροδόπης
+Έβρου

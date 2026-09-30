@@ -3,10 +3,18 @@ from __future__ import annotations
 import io
 import unicodedata
 import zipfile
+import zlib
+from dataclasses import dataclass
 
 from lxml import etree
 
-from anonymizer.errors import DocumentProcessingError, InvalidDocumentError
+from anonymizer.errors import (
+    DocumentProcessingError,
+    InvalidDocumentError,
+    ResourceLimitExceededError,
+    UnsupportedDocumentFormatError,
+)
+from anonymizer.limits import DEFAULT_LIMITS, ResourceLimits
 from anonymizer.models import (
     DocumentData,
     REDACTION_GLYPH,
@@ -22,10 +30,54 @@ DCTERMS_NS = 'http://purl.org/dc/terms/'
 
 NSMAP = {'w': W_NS}
 
+# OPC package plumbing. A DOCX is a ZIP with a contract: [Content_Types].xml
+# says what every part IS, _rels/.rels says which part is the DOCUMENT, and
+# only then does word/document.xml mean anything. Checking that a file with the
+# right NAME exists proves none of it.
+CONTENT_TYPES_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
+RELATIONSHIPS_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
+OFFICE_DOCUMENT_REL_TYPE = (
+    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument'
+)
+
+CONTENT_TYPES_PART = '[Content_Types].xml'
+ROOT_RELS_PART = '_rels/.rels'
+MAIN_DOCUMENT_PART = 'word/document.xml'
+
+# The four main-part content types this service accepts, and what each one makes
+# the package. Everything is normalised to the first before anything is read for
+# content, so the engine below only ever works on a plain document.
+DOCX_MAIN_CONTENT_TYPE = (
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'
+)
+WORD_MAIN_CONTENT_TYPES: dict[str, str] = {
+    DOCX_MAIN_CONTENT_TYPE: 'docx',
+    'application/vnd.ms-word.document.macroEnabled.main+xml': 'docm',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml': 'dotx',
+    'application/vnd.ms-word.template.macroEnabledTemplate.main+xml': 'dotm',
+}
+
+# Compression methods this service will decompress. Anything else is a file we
+# cannot read rather than a file that is wrong, and it must be refused BEFORE
+# zipfile raises NotImplementedError from somewhere deep in a read.
+_SUPPORTED_COMPRESSION = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
+_ENCRYPTED_FLAG = 0x1
+
 XML_PARSER = etree.XMLParser(
     resolve_entities=False,
     no_network=True,
     recover=True,
+    remove_blank_text=False,
+)
+
+# word/document.xml is the one part the whole pipeline depends on, so it is
+# parsed WITHOUT recovery: a malformed main document must be rejected, never
+# silently repaired into a document with no text. Other parts keep the
+# recovering parser above — a damaged header should not fail a usable file.
+STRICT_XML_PARSER = etree.XMLParser(
+    resolve_entities=False,
+    no_network=True,
+    recover=False,
     remove_blank_text=False,
 )
 
@@ -34,22 +86,367 @@ XML_PARSER = etree.XMLParser(
 # Validation
 # ---------------------------------------------------------------------------
 
-def validate_docx_bytes(data: bytes) -> None:
-    """Validate that ``data`` is a well-formed DOCX ZIP package containing the required parts. Raise InvalidDocumentError if it is not; return None."""
+@dataclass(frozen=True)
+class ZipPreflight:
+    """What the archive says about itself, before anything is decompressed."""
+
+    member_count: int
+    total_expanded_bytes: int
+    names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PackageInfo:
+    """A package that passed strict validation, and what it turned out to be.
+
+    Returned so the validation happens ONCE per document and its result is
+    carried, rather than every stage re-opening the archive to ask the same
+    questions.
+    """
+
+    main_part: str
+    main_content_type: str
+    kind: str
+    preflight: ZipPreflight
+
+
+def preflight_zip_package(
+    data: bytes, limits: ResourceLimits = DEFAULT_LIMITS
+) -> ZipPreflight:
+    """Read the central directory and refuse anything out of bounds.
+
+    DECOMPRESSES NOTHING. Every check here reads metadata the archive already
+    carries — member count, declared sizes, compression method, the encryption
+    flag — which is the only way to refuse a decompression bomb without first
+    decompressing it.
+
+    The declared sizes are not trusted afterwards: ``read_member`` caps what it
+    actually reads and the CRC check catches a central directory that lied. This
+    pass is the cheap bound, that one is the honest one, and the document needs
+    both.
+    """
     try:
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            names = set(zf.namelist())
-            bad_member = zf.testzip()
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            infos = archive.infolist()
     except (zipfile.BadZipFile, OSError) as exc:
         raise InvalidDocumentError('Not a valid DOCX package') from exc
 
-    if bad_member is not None:
-        raise InvalidDocumentError(f'Not a valid DOCX package: corrupt member {bad_member}')
+    if len(infos) > limits.max_zip_members:
+        raise ResourceLimitExceededError(
+            f'package has {len(infos)} members; the limit is {limits.max_zip_members}',
+            code='ZIP_MEMBER_COUNT_EXCEEDED',
+        )
 
-    required = ['[Content_Types].xml', '_rels/.rels', 'word/document.xml']
+    names: list[str] = []
+    seen: set[str] = set()
+    total = 0
+    for info in infos:
+        name = info.filename
+        if name in seen:
+            raise InvalidDocumentError(
+                f'package contains {name!r} more than once',
+                code='DUPLICATE_MEMBER_NAME',
+            )
+        seen.add(name)
+
+        normalised = name.replace('\\', '/')
+        if normalised.startswith('/') or '..' in normalised.split('/'):
+            raise InvalidDocumentError(
+                'package contains a member name that escapes the package',
+                code='UNSAFE_MEMBER_NAME',
+            )
+
+        if info.flag_bits & _ENCRYPTED_FLAG:
+            # Refused here so it cannot reach zipfile, which answers an
+            # encrypted member with a bare RuntimeError and would surface as a
+            # 500 for what is plainly a problem with the upload.
+            raise InvalidDocumentError(
+                f'package member {name!r} is encrypted',
+                code='ENCRYPTED_ZIP_MEMBER',
+            )
+        if info.compress_type not in _SUPPORTED_COMPRESSION:
+            raise InvalidDocumentError(
+                f'package member {name!r} uses unsupported compression method '
+                f'{info.compress_type}',
+                code='UNSUPPORTED_COMPRESSION_METHOD',
+            )
+
+        size = int(info.file_size)
+        if size > limits.max_zip_member_bytes:
+            raise ResourceLimitExceededError(
+                f'package member expands to {size} bytes; the limit is '
+                f'{limits.max_zip_member_bytes}',
+                code='ZIP_MEMBER_TOO_LARGE',
+            )
+        total += size
+        if total > limits.max_zip_total_bytes:
+            raise ResourceLimitExceededError(
+                f'package expands to more than {limits.max_zip_total_bytes} bytes',
+                code='ZIP_TOTAL_TOO_LARGE',
+            )
+
+        if size > limits.compression_ratio_floor_bytes:
+            # Only large members are judged on ratio. Small XML parts reach 30:1
+            # legitimately — the styles and settings of an ordinary decision do —
+            # so a ratio cap without this floor would refuse real documents.
+            ratio = size / max(int(info.compress_size), 1)
+            if ratio > limits.max_compression_ratio:
+                raise ResourceLimitExceededError(
+                    f'package member expands {ratio:.0f}:1; the limit is '
+                    f'{limits.max_compression_ratio:.0f}:1',
+                    code='ZIP_COMPRESSION_RATIO_EXCEEDED',
+                )
+
+        names.append(name)
+
+    return ZipPreflight(
+        member_count=len(infos), total_expanded_bytes=total, names=tuple(names)
+    )
+
+
+def read_member(
+    archive: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> bytes:
+    """Read one member, never more than it declared and never past the cap.
+
+    The read stops at ``file_size + 1`` bytes, so a central directory that
+    understates a member cannot make this allocate without bound. Reading to the
+    declared end also runs zipfile's CRC check, which is what catches a
+    directory that lied in the other direction.
+    """
+    cap = min(int(info.file_size), limits.max_zip_member_bytes)
+    try:
+        with archive.open(info) as handle:
+            data = handle.read(cap + 1)
+    except (zipfile.BadZipFile, EOFError, zlib.error, ValueError, OSError) as exc:
+        # NOT RuntimeError or NotImplementedError: the preflight already refused
+        # encrypted and unsupported members, so seeing one here would mean a bug
+        # in this file rather than a problem with the upload, and dressing a bug
+        # up as a 400 sends the caller to look at a document that is fine.
+        raise InvalidDocumentError(
+            f'package member {info.filename!r} could not be read',
+            code='CORRUPT_ZIP_MEMBER',
+        ) from exc
+    if len(data) > cap:
+        raise ResourceLimitExceededError(
+            f'package member {info.filename!r} is larger than it declared',
+            code='ZIP_MEMBER_TOO_LARGE',
+        )
+    return data
+
+
+def read_members(
+    archive: zipfile.ZipFile,
+    infos: list[zipfile.ZipInfo],
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> dict[str, bytes]:
+    """Read every member into memory, bounded in total as well as per member."""
+    package: dict[str, bytes] = {}
+    total = 0
+    for info in infos:
+        blob = read_member(archive, info, limits)
+        total += len(blob)
+        if total > limits.max_zip_total_bytes:
+            raise ResourceLimitExceededError(
+                f'package expands to more than {limits.max_zip_total_bytes} bytes',
+                code='ZIP_TOTAL_TOO_LARGE',
+            )
+        package[info.filename] = blob
+    return package
+
+
+def _strict_root(blob: bytes, part_name: str, expected_tag: str) -> etree._Element:
+    """Strictly parse a required part and confirm its root element.
+
+    Required parts get the NON-recovering parser. The recovering one turns
+    rubbish into an empty tree, and an empty [Content_Types].xml would mean
+    "this package declares nothing" rather than "this package is broken".
+    """
+    try:
+        root = etree.fromstring(blob, parser=STRICT_XML_PARSER)
+    except etree.XMLSyntaxError as exc:
+        raise InvalidDocumentError(
+            f'{part_name} is not valid XML: {exc}',
+            code='MALFORMED_PACKAGE_XML',
+        ) from exc
+    if root is None or root.tag != expected_tag:
+        raise InvalidDocumentError(
+            f'{part_name} has an unexpected root element',
+            code='MALFORMED_PACKAGE_XML',
+        )
+    return root
+
+
+def _main_document_target(rels_root: etree._Element) -> str:
+    """The part the root relationships name as the office document.
+
+    Exactly one officeDocument relationship is required. None means the package
+    never says which part is the document; several mean it says so twice and we
+    would be choosing.
+    """
+    targets: list[str] = []
+    for relationship in rels_root:
+        if not isinstance(relationship.tag, str):
+            continue
+        if relationship.get('Type') != OFFICE_DOCUMENT_REL_TYPE:
+            continue
+        target = (relationship.get('Target') or '').strip()
+        if target:
+            targets.append(target.lstrip('/'))
+
+    if not targets:
+        raise InvalidDocumentError(
+            'package has no officeDocument relationship',
+            code='INVALID_ROOT_RELATIONSHIP',
+        )
+    if len(targets) > 1:
+        raise InvalidDocumentError(
+            'package declares more than one officeDocument relationship',
+            code='INVALID_ROOT_RELATIONSHIP',
+        )
+    return targets[0]
+
+
+def _override_content_type(content_types_root: etree._Element, part_name: str) -> str:
+    """The content type [Content_Types].xml declares for one part."""
+    wanted = '/' + part_name
+    for override in content_types_root:
+        if not isinstance(override.tag, str):
+            continue
+        if etree.QName(override).localname != 'Override':
+            continue
+        if (override.get('PartName') or '').strip() == wanted:
+            return (override.get('ContentType') or '').strip()
+    raise InvalidDocumentError(
+        f'{CONTENT_TYPES_PART} declares no content type for {part_name}',
+        code='MALFORMED_PACKAGE_XML',
+    )
+
+
+def _validate_main_document_xml(blob: bytes) -> None:
+    """Strictly parse ``word/document.xml`` and confirm it really is a Word document.
+
+    The package-level checks above prove the archive is a well-formed OPC
+    package that says it contains a Word document. They do not prove the
+    document PARSES: a file can carry every expected name and relationship while
+    its main part is truncated, wrongly encoded, or not WordprocessingML at all
+    — and the recovering parser used for the rest of the package would turn that
+    into an empty document, i.e. an empty redaction plan and an "anonymized"
+    file that was never read. Rejecting it here is the whole point of this
+    function.
+
+    Raises InvalidDocumentError when the XML does not parse, when its root is
+    not ``w:document``, or when it has no ``w:body``. Returns None.
+    """
+    try:
+        root = etree.fromstring(blob, parser=STRICT_XML_PARSER)
+    except etree.XMLSyntaxError as exc:
+        raise InvalidDocumentError(
+            f'word/document.xml is not valid XML: {exc}'
+        ) from exc
+
+    if root is None or root.tag != f'{{{W_NS}}}document':
+        found = getattr(root, 'tag', None)
+        raise InvalidDocumentError(
+            'word/document.xml is not a WordprocessingML document '
+            f'(root element is {found!r}, expected w:document)'
+        )
+
+    if root.find(f'{{{W_NS}}}body') is None:
+        raise InvalidDocumentError('word/document.xml has no w:body element')
+
+
+def validate_docx_package(
+    data: bytes,
+    *,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+    expect_main_content_type: str | None = DOCX_MAIN_CONTENT_TYPE,
+) -> PackageInfo:
+    """Validate an OOXML Word package strictly, and say what it is.
+
+    In order: preflight the archive, confirm the three required parts exist,
+    strictly parse ``[Content_Types].xml`` and ``_rels/.rels``, resolve the
+    officeDocument relationship, check what the package says its main part IS,
+    and only then parse the main part itself.
+
+    ``expect_main_content_type`` is the type the caller requires. Pass None to
+    accept any of the four Word kinds, which is what format sniffing needs
+    before normalisation; the default requires a plain document, which is what
+    everything after normalisation needs.
+    """
+    preflight = preflight_zip_package(data, limits)
+    names = set(preflight.names)
+
+    required = [CONTENT_TYPES_PART, ROOT_RELS_PART, MAIN_DOCUMENT_PART]
     missing = [name for name in required if name not in names]
     if missing:
-        raise InvalidDocumentError('Not a valid DOCX package: missing ' + ', '.join(missing))
+        raise InvalidDocumentError(
+            'Not a valid DOCX package: missing ' + ', '.join(missing)
+        )
+
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        by_name = {info.filename: info for info in archive.infolist()}
+        content_types_blob = read_member(archive, by_name[CONTENT_TYPES_PART], limits)
+        rels_blob = read_member(archive, by_name[ROOT_RELS_PART], limits)
+        main_blob = read_member(archive, by_name[MAIN_DOCUMENT_PART], limits)
+
+    content_types_root = _strict_root(
+        content_types_blob, CONTENT_TYPES_PART, f'{{{CONTENT_TYPES_NS}}}Types'
+    )
+    rels_root = _strict_root(
+        rels_blob, ROOT_RELS_PART, f'{{{RELATIONSHIPS_NS}}}Relationships'
+    )
+
+    main_part = _main_document_target(rels_root)
+    if main_part not in names:
+        raise InvalidDocumentError(
+            'the officeDocument relationship points at a part that is not in '
+            'the package',
+            code='INVALID_ROOT_RELATIONSHIP',
+        )
+    content_type = _override_content_type(content_types_root, main_part)
+
+    kind = WORD_MAIN_CONTENT_TYPES.get(content_type)
+    if kind is None:
+        # A well-formed OPC package that is not a Word document: a spreadsheet,
+        # a presentation, something else entirely. Nothing is wrong with it, so
+        # this is an unsupported format rather than a malformed one.
+        raise UnsupportedDocumentFormatError(
+            'the package is not a Word document'
+        )
+    if expect_main_content_type is not None and content_type != expect_main_content_type:
+        raise InvalidDocumentError(
+            f'expected the main document part to be {expect_main_content_type!r}',
+            code='UNEXPECTED_MAIN_CONTENT_TYPE',
+        )
+    if main_part != MAIN_DOCUMENT_PART:
+        # Word always writes word/document.xml, and five modules address it by
+        # that literal name. Supporting an arbitrary target would mean threading
+        # the resolved name through all of them for a case that does not occur.
+        raise InvalidDocumentError(
+            f'the main document part must be {MAIN_DOCUMENT_PART}',
+            code='UNSUPPORTED_MAIN_PART_NAME',
+        )
+
+    _validate_main_document_xml(main_blob)
+    return PackageInfo(
+        main_part=main_part,
+        main_content_type=content_type,
+        kind=kind,
+        preflight=preflight,
+    )
+
+
+def validate_docx_bytes(data: bytes) -> None:
+    """Validate that ``data`` is a well-formed DOCX package. Raise InvalidDocumentError if not.
+
+    Thin wrapper over :func:`validate_docx_package` for callers that only need
+    the verdict, kept because it is the shape the rest of the package and the
+    tests already use.
+    """
+    validate_docx_package(data)
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +552,13 @@ def _extract_para_chars(
             for idx, ch in enumerate(text):
                 # Per-character NFC — never whole-string, which would shift
                 # offsets and desynchronize the char map from the node text.
-                chars.append(unicodedata.normalize('NFC', ch))
+                norm = unicodedata.normalize('NFC', ch)
+                if len(norm) != 1:
+                    # NFC of a single char can expand to several (rare,
+                    # composition-excluded codepoints). The 1 char : 1 ref
+                    # alignment outranks normalization — keep the original.
+                    norm = ch
+                chars.append(norm)
                 char_map.append(XmlCharRef(part_name, node_path, idx))
         elif node.tag == f'{{{W_NS}}}tab':
             chars.append('\t')
@@ -166,6 +569,9 @@ def _extract_para_chars(
         elif node.tag == f'{{{W_NS}}}cr':
             chars.append('\n')
             char_map.append(XmlCharRef(part_name, '<w:cr/>', 0))
+    # Load-bearing invariant: index i of the extracted text must always map to
+    # char_map[i], or every downstream span offset is wrong.
+    assert len(chars) == len(char_map), "char/char_map desynchronized"
     return chars, char_map
 
 
@@ -173,14 +579,34 @@ def _extract_para_chars(
 # Parsing a DOCX into TextUnits
 # ---------------------------------------------------------------------------
 
-def parse_docx(data: bytes, document_id: str) -> DocumentData:
-    """Parse DOCX bytes into a DocumentData of TextUnits (table cells and paragraphs with per-character XML maps) for all Word text parts. Raise InvalidDocumentError on malformed packages."""
-    validate_docx_bytes(data)
+def parse_docx(
+    data: bytes,
+    document_id: str,
+    *,
+    package: PackageInfo | None = None,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> DocumentData:
+    """Parse DOCX bytes into a DocumentData of TextUnits (table cells and paragraphs with per-character XML maps) for all Word text parts. Raise InvalidDocumentError on malformed packages.
+
+    ``package`` is a validation this caller has already done. Passing it skips a
+    second strict pass over the same bytes; omitting it validates here, which is
+    what keeps every entry point safe by default — the postcheck in particular
+    validates the output itself rather than trusting anything the pipeline says
+    about it.
+    """
+    if package is None:
+        validate_docx_package(data, limits=limits)
 
     with zipfile.ZipFile(io.BytesIO(data)) as zin:
-        package_data = {info.filename: zin.read(info.filename) for info in zin.infolist()}
+        package_data = read_members(zin, list(zin.infolist()), limits)
 
     parsed_parts = _parse_xml_parts(package_data)
+    if 'word/document.xml' not in parsed_parts:
+        # validate_docx_bytes just parsed this part strictly, so the recovering
+        # parser dropping it would mean the two disagree. Refuse rather than
+        # build an empty plan from a document nothing actually read.
+        raise InvalidDocumentError('word/document.xml could not be parsed')
+
     text_units: list[TextUnit] = []
     unit_counter = 0
 
@@ -354,13 +780,26 @@ def _set_child_text(root: etree._Element, qname: str, text: str) -> None:
 
 
 def _cleanup_core_properties(parsed_parts: dict[str, etree._Element]) -> None:
-    """Blank identifying core properties (creator, lastModifiedBy, title, keywords, category) in docProps/core.xml and reset created/modified timestamps to a fixed epoch. Returns None."""
+    """Blank identifying core properties in docProps/core.xml and reset the
+    created/modified timestamps to a fixed epoch. Returns None.
+
+    dc:creator AND cp:lastModifiedBy ARE DELIBERATELY LEFT ALONE, and this is a
+    ΔΕΔ-COMPATIBILITY DECISION RATHER THAN A PRIVACY ONE. The published gold
+    decisions keep both — ``dc:creator`` reads "user" and ``cp:lastModifiedBy``
+    carries the name of the clerk who prepared the file — and matching that
+    output byte for byte is the requirement this service is held to.
+
+    It is NOT a general privacy guarantee, and nothing downstream makes it one:
+    a future ``cp:lastModifiedBy`` can hold a person's real name, it is not text
+    the detectors ever see, and the post-redaction scan no longer fails a
+    document for it. A deployment that needs the stronger behaviour has to add
+    these two names back to the list below AND restore the matching HIGH
+    findings in anonymizer.postcheck.
+    """
     root = parsed_parts.get('docProps/core.xml')
     if root is None:
         return
     _blank_children(root, [
-        f'{{{DC_NS}}}creator',
-        f'{{{CP_NS}}}lastModifiedBy',
         f'{{{DC_NS}}}title',
         f'{{{CP_NS}}}keywords',
         f'{{{CP_NS}}}category',
@@ -531,15 +970,23 @@ def _copy_zipinfo(info: zipfile.ZipInfo) -> zipfile.ZipInfo:
     return copied
 
 
-def write_redacted_docx(input_bytes: bytes, document: DocumentData, plan: RedactionPlan) -> bytes:
+def write_redacted_docx(
+    input_bytes: bytes,
+    document: DocumentData,
+    plan: RedactionPlan,
+    *,
+    package: PackageInfo | None = None,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> bytes:
     """Produce redacted DOCX bytes from ``input_bytes`` by applying the redaction plan and cleaning sensitive parts, copying untouched members verbatim. Return the new package bytes; raise DocumentProcessingError on failure."""
-    validate_docx_bytes(input_bytes)
+    if package is None:
+        validate_docx_package(input_bytes, limits=limits)
 
     stage = 'read'
     try:
         with zipfile.ZipFile(io.BytesIO(input_bytes)) as zin:
             infos = list(zin.infolist())
-            package_data = {info.filename: zin.read(info.filename) for info in infos}
+            package_data = read_members(zin, infos, limits)
 
         stage = 'parse'
         parsed_parts = _parse_xml_parts(package_data)
@@ -565,16 +1012,32 @@ def write_redacted_docx(input_bytes: bytes, document: DocumentData, plan: Redact
                     payload = package_data[name]
                 zout.writestr(_copy_zipinfo(info), payload)
         return output.getvalue()
-    except (InvalidDocumentError, DocumentProcessingError):
+    except (
+        InvalidDocumentError,
+        DocumentProcessingError,
+        ResourceLimitExceededError,
+        UnsupportedDocumentFormatError,
+    ):
         raise
     except Exception as exc:
         raise DocumentProcessingError(f'failed during {stage}') from exc
 
 
 __all__ = [
-    'validate_docx_bytes',
-    'parse_docx',
-    'write_redacted_docx',
+    'CONTENT_TYPES_PART',
+    'DOCX_MAIN_CONTENT_TYPE',
+    'MAIN_DOCUMENT_PART',
+    'PackageInfo',
+    'ROOT_RELS_PART',
+    'WORD_MAIN_CONTENT_TYPES',
+    'ZipPreflight',
     'apply_plan',
     'clean_sensitive_parts',
+    'parse_docx',
+    'preflight_zip_package',
+    'read_member',
+    'read_members',
+    'validate_docx_bytes',
+    'validate_docx_package',
+    'write_redacted_docx',
 ]

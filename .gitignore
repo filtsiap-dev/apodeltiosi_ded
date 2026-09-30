@@ -1,2 +1,59 @@
 # Never commit real secrets.
 .env
+.env.*
+!.env.example
+
+# Build / runtime artifacts.
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.claude/
+
+# Local operational notes; the tracked VM guide uses environment variables.
+/curl -X POST http172.21.0.168000ano.txt
+/How_to_run.docx
+
+# Office temporary files.
+~$*
+
+# Real ΔΕΔ documents and live-run evidence — never published.
+αποφασεις/
+ανωνυμποιηση ΔΕΔ/
+ανωνυμοποιηση test python/
+review_runs/
+How_to_run.docx
+
+# Real ΔΕΔ documents and live-run evidence — never published.
+αποφασεις/
+ανωνυμποιηση ΔΕΔ/
+ανωνυμοποιηση test python/
+review_runs/
+How_to_run.docx
+
+# Development only — never shipped, and excluded from the image already.
+tests/
+tools/
+audit/
+BUILDER_REPORT.md
+CODEBASE_GUIDE.md
+skill_analysis_reusable_patterns.md
+
+# Real ΔΕΔ documents and live-run evidence — never published.
+αποφασεις/
+ανωνυμποιηση ΔΕΔ/
+ανωνυμοποιηση test python/
+review_runs/
+How_to_run.docx
+
+# Development only.
+tests/
+tools/
+audit/
+BUILDER_REPORT.md
+CODEBASE_GUIDE.md
+skill_analysis_reusable_patterns.md

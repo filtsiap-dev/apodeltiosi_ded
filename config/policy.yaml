@@ -3,9 +3,17 @@ policy:
   redact_high_confidence_threshold: 0.9
   redact_threshold: 0.7
 
-  # Hard preserves: even at low confidence, never redact these categories
+  # HARD PRESERVE: authoritative, category-level, confidence-independent.
+  # A PRESERVE span in one of these categories is a decision, not a
+  # recommendation — it is withheld from the LLM pass-2 decision queue, so
+  # neither pass can adjudicate it, and it outranks every ordinary span in the
+  # resolver. Only a hard redact (below) can still take it.
+  #
+  # Categories NOT listed here still produce ordinary PRESERVE spans; those are
+  # recommendations, they are sent to pass 2 for final adjudication, and no
+  # amount of confidence turns one into a hard preserve. DATE in particular is
+  # deliberately absent: a date can be a date of birth.
   hard_preserve_categories:
-    - DATE
     - DOU
     - PUBLIC_SERVICE
     - LEGAL_REF
@@ -13,11 +21,18 @@ policy:
     - TAX_YEAR
     - ARTICLE_REF
     - COURT_DECISION
-    - PUBLIC_AUTHORITY_HEADER
     - DECISION_METADATA
-    - OFFICIAL_SIGNATORY
     - PERCENTAGE
     - FISCAL_PERIOD
+    # The structural label that introduces a value ("Α.Φ.Μ.", "ΑΤΑΚ", "οδός").
+    # Hard because it is mechanically certain: a token only enters this
+    # category if it can never itself be, or begin, personal data. This is what
+    # stops an over-wide span taking the label along with the value.
+    - FIELD_LABEL
+    # A date with POSITIVE evidence that it is procedural ("ημερομηνία
+    # κατάθεσης", "εκδόθηκε στις"). Note that DATE stays out, for the
+    # reason above: only this one has been shown not to be a date of birth.
+    - PROCEDURAL_DATE
 
   # Hard redacts: if seen with confidence >= 0.9, no preserve can shield them
   hard_redact_categories:
@@ -25,6 +40,18 @@ policy:
     - AMKA
     - IBAN
     - EMAIL
+    # Cadastral / property-register identifiers (ΑΤΑΚ, ΚΑΕΚ, Ο.Τ., Α.Χ.Κ.,
+    # notice numbers). Safe to make hard only because every one of them is
+    # cue-anchored and captures the value in group 1, so no PROPERTY_ID span can
+    # ever cover the label that a hard preserve is protecting.
+    - PROPERTY_ID
+    # The toponym after an AUTHORITY cue — "Δήμου Χαλκιδέων", "Πρωτοδικείου
+    # Χαλκίδας". Hard ONLY at confidence 1.0, which only the authority-cued
+    # pattern emits: a district or area name ("συνοικία Η΄ Χαλκίδας") is scored
+    # 0.85 by the same detector and stays an ordinary proposal for pass 2, which
+    # is what the gold does with it. A Δ.Ο.Υ. name carries no locality cue and
+    # is therefore untouched by this tier.
+    - LOCALITY
 
   preserve_email_domains:
     - aade.gr
