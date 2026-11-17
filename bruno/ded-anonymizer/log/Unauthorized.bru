@@ -1,0 +1,25 @@
+meta {
+  name: Unauthorized (no token)
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{baseUrl}}/anonymize-log
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {"user_query": "επιδομα α21"}
+}
+
+tests {
+  test("a request without a token is refused", function() {
+    expect(res.status).to.equal(401);
+  });
+}

@@ -1,0 +1,24 @@
+# Run the anonymizer in a container:
+#
+#   docker compose up --build        (the service listens on http://localhost:8000)
+#   docker compose down
+#
+# Compose reads a `.env` file next to this file for the ${...} values below (the same `.env` that RUNNING.md
+# describes). ANON_API_KEY is required. POST /anonymize-text and POST /anonymize-log never call an LLM; only
+# POST /anonymize (.docx) does, so the provider defaults to `regex` (no model, no model keys; /anonymize answers
+# 503). A .docx deployment sets ANON_PROVIDER=openai with OPENAI_API_KEY and ANON_MODEL in .env (Azure: add
+# AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, ANON_AZURE_DEPLOYMENT, ANON_AZURE_API_VERSION below).
+services:
+  anonymizer:
+    build: .
+    image: ded-anonymizer:local
+    ports:
+      - "${ANON_PORT:-8000}:8000"
+    environment:
+      ANON_API_KEY: ${ANON_API_KEY:?set ANON_API_KEY in .env or in the shell}
+      ANON_PROVIDER: ${ANON_PROVIDER:-regex}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANON_MODEL: ${ANON_MODEL:-}
+    # The service drains requests for up to 120 s on shutdown (README: "Graceful shutdown").
+    stop_grace_period: 130s
+    restart: unless-stopped

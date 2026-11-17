@@ -1,0 +1,52 @@
+meta {
+  name: Mask personal data
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/anonymize-text
+  body: text
+  auth: bearer
+}
+
+headers {
+  Content-Type: text/plain; charset=utf-8
+}
+
+auth:bearer {
+  token: {{apiKey}}
+}
+
+body:text {
+  Ονομάζομαι Μιχάλης Κόκκινος, γεννήθηκα στις 27/10/1984, με ΑΦΜ 090000045 και μένω στην Αμοργού 4, Κυψέλη.
+}
+
+tests {
+  test("returns 200 and the masked text", function() {
+    expect(res.status).to.equal(200);
+    expect(res.getHeader("content-type")).to.include("text/plain");
+  });
+  test("the name, the date of birth and the ΑΦΜ are masked", function() {
+    expect(res.body).to.not.include("Μιχάλης");
+    expect(res.body).to.not.include("Κόκκινος");
+    expect(res.body).to.not.include("27/10/1984");
+    expect(res.body).to.not.include("090000045");
+  });
+  test("the length is unchanged and locations are kept (owner decision)", function() {
+    expect(res.body.length).to.equal(105);
+    expect(res.body).to.include("Αμοργού 4, Κυψέλη");
+  });
+  test("headers report what was masked", function() {
+    expect(res.getHeader("x-anonymization-status")).to.equal("anonymized");
+    expect(res.getHeader("x-redaction-counts")).to.include("PERSON=2");
+    expect(res.getHeader("x-redaction-counts")).to.include("AFM=1");
+    expect(res.getHeader("x-redaction-counts")).to.include("DOB=1");
+  });
+}
+
+docs {
+  Masks every character of a detected name, ΑΦΜ and date of birth with ".". Whitespace stays, so the text
+  keeps its length. Headers: x-anonymization-status (anonymized | needs-review), x-redaction-counts,
+  x-review-reasons (only when needs-review), x-document-id, x-processing-time-ms.
+}

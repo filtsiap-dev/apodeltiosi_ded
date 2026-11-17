@@ -1,0 +1,44 @@
+meta {
+  name: Long whitespace after a label is fast
+  type: http
+  seq: 9
+}
+
+post {
+  url: {{baseUrl}}/anonymize-text
+  body: text
+  auth: bearer
+}
+
+headers {
+  Content-Type: text/plain; charset=utf-8
+}
+
+auth:bearer {
+  token: {{apiKey}}
+}
+
+body:text {
+  replaced by the pre-request script
+}
+
+script:pre-request {
+  req.setBody("ΑΦΜ" + " ".repeat(50000) + "x");
+}
+
+tests {
+  test("returns 200 with the text unchanged", function() {
+    expect(res.status).to.equal(200);
+    expect(res.body.length).to.equal(50004);
+    expect(res.getHeader("x-redaction-counts")).to.equal("none");
+  });
+  test("answers within 2 seconds", function() {
+    expect(res.getResponseTime()).to.be.below(2000);
+  });
+}
+
+docs {
+  "ΑΦΜ", 50,000 spaces, then a letter. The label patterns used to try every split of the spaces before giving up
+  (23 s for 20,000 spaces, growing with the square of the length); they are now linear and answer in well
+  under a second.
+}

@@ -1,0 +1,32 @@
+meta {
+  name: user_query is not a string
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/anonymize-log
+  body: json
+  auth: bearer
+}
+
+headers {
+  Content-Type: application/json
+}
+
+auth:bearer {
+  token: {{apiKey}}
+}
+
+body:json {
+  {"session_id": "s1", "user_query": 42, "status": "completed"}
+}
+
+tests {
+  test("the entry is returned and flagged for review", function() {
+    expect(res.status).to.equal(200);
+    expect(res.body.user_query).to.equal(42);
+    expect(res.getHeader("x-anonymization-status")).to.equal("needs-review");
+    expect(res.getHeader("x-review-reasons")).to.equal("user_query_not_a_string");
+  });
+}

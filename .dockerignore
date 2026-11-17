@@ -1,0 +1,17 @@
+# The Dockerfile copies only pom.xml, src and config. Everything else stays out of the build context:
+# secrets (.env), the 100+ MB of downloaded dictionaries (.cache), build output, VCS and tooling.
+# config/chat/*.md and config/chat/licenses ARE needed in the image (the licence notices travel with the word lists).
+.git
+.github
+.idea
+.cache
+.superpowers
+.env
+target
+eval
+docs
+bruno
+docker-compose.yml
+/*.md
+FINAL_REVIEW.md
+How_to_run_Java.docx

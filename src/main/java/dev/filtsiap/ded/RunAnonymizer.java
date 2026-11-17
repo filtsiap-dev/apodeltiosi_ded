@@ -1,0 +1,506 @@
+package dev.filtsiap.ded;
+
+import dev.filtsiap.ded.anonymizer.AnonymizeResult;
+import dev.filtsiap.ded.anonymizer.AnonymizerError;
+import dev.filtsiap.ded.anonymizer.Config;
+import dev.filtsiap.ded.anonymizer.DocumentAccounting;
+import dev.filtsiap.ded.anonymizer.ConfigurationError;
+import dev.filtsiap.ded.anonymizer.DocumentTimeoutError;
+import dev.filtsiap.ded.anonymizer.FileConfig;
+import dev.filtsiap.ded.anonymizer.Pipeline;
+import dev.filtsiap.ded.anonymizer.PlanSummary;
+import dev.filtsiap.ded.anonymizer.PostcheckFinding;
+import dev.filtsiap.ded.anonymizer.PostcheckSummary;
+import dev.filtsiap.ded.anonymizer.ResidualPIIError;
+import dev.filtsiap.ded.anonymizer.RunContext;
+import dev.filtsiap.ded.anonymizer.RuntimeConfig;
+import dev.filtsiap.ded.anonymizer.UnresolvedFinding;
+import dev.filtsiap.ded.anonymizer.llm.LlmUsage;
+import dev.filtsiap.ded.anonymizer.llm.LlmClient;
+import dev.filtsiap.ded.anonymizer.llm.LlmClients;
+import dev.filtsiap.ded.anonymizer.llm.RegexModeLlmClient;
+import dev.filtsiap.ded.anonymizer.pycompat.PyFloat;
+import dev.filtsiap.ded.anonymizer.pycompat.PyJson;
+import dev.filtsiap.ded.anonymizer.pycompat.PyRepr;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Command-line runner (rewrite of {@code run_anonymizer.py}): same arguments, output lines and
+ * exit codes. Uses only the public pipeline API.
+ *
+ * <p>Every document gets its own budget of {@code ANON_DOCUMENT_DEADLINE_S} and its own generated
+ * correlation ids (never the file name: whoever named the file chose it, and it can contain a
+ * person's name), and exactly one {@code document_finished} log line, as the HTTP service.
+ *
+ * <p>Exit codes: 0 all processed; 1 at least one failed; 2 usage error; 3 configuration error;
+ * 4 otherwise successful but at least one document blocked by the mandatory post-redaction scan;
+ * 5 none failed but at least one exceeded its end-to-end processing budget; 130 interrupted
+ * (Ctrl+C). With several documents the lowest-numbered failure wins: 1 over 5 over 4.
+ */
+public final class RunAnonymizer {
+
+    static final int EXIT_OK = 0;
+    static final int EXIT_PROCESSING_FAILED = 1;
+    static final int EXIT_USAGE = 2;
+    static final int EXIT_CONFIG = 3;
+    static final int EXIT_QA_HIGH = 4;
+    static final int EXIT_TIMEOUT = 5;
+
+    private static final Logger LOG = LoggerFactory.getLogger("run_anonymizer");
+
+    private static final String REDACTED_SUFFIX = "_redacted.docx";
+    private static final String PROG = "run_anonymizer";
+
+    static final String USAGE = """
+            usage: run_anonymizer [-h] [--file FILE] [--out-dir OUT_DIR]
+                                  [--config-dir CONFIG_DIR] [--qa] [--summary-json]
+                                  [input]
+            """;
+
+    static final String HELP = USAGE + """
+
+            Anonymize one Greek DED decision DOCX, or every .docx in a folder, via the v2
+            pipeline (deterministic detectors + mandatory two-pass LLM).
+
+            positional arguments:
+              input                 Path to a .docx file, or a folder containing .docx
+                                    files (non-recursive). Alternative to --file; give
+                                    exactly one of the two.
+
+            options:
+              -h, --help            show this help message and exit
+              --file FILE           Path to a .docx file, or a folder containing .docx
+                                    files (non-recursive). Alternative to the positional
+                                    argument; give exactly one of the two.
+              --out-dir OUT_DIR     Directory for redacted outputs. Default: next to each
+                                    input file. Outputs are named <stem>_redacted.docx.
+              --config-dir CONFIG_DIR
+                                    Directory holding policy.yaml / regex_patterns.yaml /
+                                    allowlists/. Default: the config/ folder next to this
+                                    script.
+              --qa                  Print every finding of the post-redaction residual-
+                                    leak scan. The scan itself always runs — this flag
+                                    only makes it verbose.
+              --summary-json        Print each document's counts-only summary as one JSON
+                                    line.
+            """;
+
+    private RunAnonymizer() {
+    }
+
+    // ------------------------------------------------------------------ argument parsing
+
+    /** Parsed arguments. */
+    record Args(String input, String file, String outDir, String configDir, boolean qa, boolean summaryJson) {
+    }
+
+    /** Signals an argparse exit (help or usage error) with its code. */
+    static final class ArgExit extends Exception {
+        private static final long serialVersionUID = 1L;
+        final int code;
+
+        ArgExit(int code) {
+            super(null, null, false, false);
+            this.code = code;
+        }
+    }
+
+    private static final List<String> LONG_OPTIONS =
+            List.of("--help", "--file", "--out-dir", "--config-dir", "--qa", "--summary-json");
+
+    /** argparse semantics: unique-prefix abbreviations, {@code --opt=value}, {@code --}, last value wins. */
+    static Args parseArgs(String[] argv, PrintStream out, PrintStream err) throws ArgExit {
+        String input = null;
+        String file = null;
+        String outDir = null;
+        String configDir = null;
+        boolean qa = false;
+        boolean summaryJson = false;
+        List<String> unrecognized = new ArrayList<>();
+        boolean positionalOnly = false;
+
+        for (int i = 0; i < argv.length; i++) {
+            String tok = argv[i];
+            if (!positionalOnly && tok.equals("--")) {
+                positionalOnly = true;
+                continue;
+            }
+            if (!positionalOnly && tok.startsWith("--") && tok.length() > 2) {
+                int eq = tok.indexOf('=');
+                String name = eq < 0 ? tok : tok.substring(0, eq);
+                String inlineValue = eq < 0 ? null : tok.substring(eq + 1);
+                List<String> matches = LONG_OPTIONS.contains(name) ? List.of(name)
+                        : LONG_OPTIONS.stream().filter(o -> o.startsWith(name)).toList();
+                if (matches.isEmpty()) {
+                    unrecognized.add(tok);
+                    continue;
+                }
+                if (matches.size() > 1) {
+                    usageError(err, "ambiguous option: " + name + " could match " + String.join(", ", matches));
+                }
+                String opt = matches.get(0);
+                switch (opt) {
+                    case "--help", "--qa", "--summary-json" -> {
+                        if (inlineValue != null) {
+                            usageError(err, "argument " + opt + ": ignored explicit argument "
+                                    + PyRepr.repr(inlineValue));
+                        }
+                        if (opt.equals("--help")) {
+                            out.print(platformLines(HELP));
+                            throw new ArgExit(0);
+                        }
+                        if (opt.equals("--qa")) {
+                            qa = true;
+                        } else {
+                            summaryJson = true;
+                        }
+                    }
+                    default -> {
+                        String value = inlineValue;
+                        if (value == null) {
+                            if (i + 1 >= argv.length || looksLikeOption(argv[i + 1])) {
+                                usageError(err, "argument " + opt + ": expected one argument");
+                            }
+                            value = argv[++i];
+                        }
+                        switch (opt) {
+                            case "--file" -> file = value;
+                            case "--out-dir" -> outDir = value;
+                            default -> configDir = value;
+                        }
+                    }
+                }
+                continue;
+            }
+            if (!positionalOnly && tok.equals("-h")) {
+                out.print(platformLines(HELP));
+                throw new ArgExit(0);
+            }
+            if (!positionalOnly && looksLikeOption(tok)) {
+                unrecognized.add(tok);
+                continue;
+            }
+            if (input == null) {
+                input = tok;
+            } else {
+                unrecognized.add(tok);
+            }
+        }
+        if (!unrecognized.isEmpty()) {
+            usageError(err, "unrecognized arguments: " + String.join(" ", unrecognized));
+        }
+        return new Args(input, file, outDir, configDir, qa, summaryJson);
+    }
+
+    /** Python writes help text in text mode, so on Windows its line breaks are CRLF, like println's. */
+    static String platformLines(String text) {
+        return text.replace("\n", System.lineSeparator());
+    }
+
+    private static boolean looksLikeOption(String tok) {
+        return tok.startsWith("-") && tok.length() > 1 && !tok.matches("-\\d+(\\.\\d*)?|-\\.\\d+");
+    }
+
+    private static void usageError(PrintStream err, String message) throws ArgExit {
+        err.print(platformLines(USAGE));
+        err.println(PROG + ": error: " + message);
+        throw new ArgExit(EXIT_USAGE);
+    }
+
+    // ------------------------------------------------------------------ inputs and outputs
+
+    private static final boolean WINDOWS = System.getProperty("os.name", "").toLowerCase(Locale.ROOT).startsWith("win");
+
+    /** A file yields itself; a folder its non-recursive .docx children minus prior outputs, sorted like Python paths. */
+    static List<Path> collectInputs(Path inputPath) {
+        if (Files.isRegularFile(inputPath)) {
+            return List.of(inputPath);
+        }
+        if (!Files.isDirectory(inputPath)) {
+            return List.of();
+        }
+        List<Path> found = new ArrayList<>();
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(inputPath, "*.docx")) {
+            for (Path p : stream) {
+                if (Files.isRegularFile(p) && !p.getFileName().toString().endsWith(REDACTED_SUFFIX)) {
+                    found.add(p);
+                }
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        // PurePosixPath compares by code point; PureWindowsPath case-insensitively.
+        Comparator<Path> order = WINDOWS
+                ? Comparator.comparing(p -> p.toString().toLowerCase(Locale.ROOT))
+                : Comparator.comparing(Path::toString, dev.filtsiap.ded.anonymizer.pycompat.PyStr.CODE_POINT_ORDER);
+        found.sort(order);
+        return found;
+    }
+
+    /** Python {@code str(Path(s))}: "." segments and duplicate separators collapsed, trailing separator dropped. */
+    static String pyPath(Path p) {
+        Path out = p.getRoot();
+        for (Path part : p) {
+            if (!part.toString().equals(".")) {
+                out = out == null ? part : out.resolve(part);
+            }
+        }
+        return out == null ? "." : out.toString();
+    }
+
+    static String stem(Path p) {
+        String name = p.getFileName().toString();
+        int dot = name.lastIndexOf('.');
+        return dot > 0 ? name.substring(0, dot) : name;
+    }
+
+    static Path outputPath(Path source, Path outDir) {
+        Path dir = outDir != null ? outDir : (source.getParent() != null ? source.getParent() : Path.of(""));
+        return dir.resolve(stem(source) + REDACTED_SUFFIX);
+    }
+
+    private static void printQa(PrintStream out, PostcheckSummary qa, String sourceName) {
+        if (qa == null) {
+            return;
+        }
+        out.println("  qa[" + sourceName + "]: " + (qa.clean() ? "CLEAN" : "FINDINGS") + " total=" + qa.findingsTotal()
+                + " by_severity=" + PyRepr.repr(qa.bySeverity()) + " by_kind=" + PyRepr.repr(qa.byKind()));
+        for (PostcheckFinding f : qa.findings()) {
+            out.println("    " + String.format("%-6s", f.severity().name()) + " " + String.format("%-28s", f.kind())
+                    + " " + f.location() + ": " + f.detail());
+        }
+    }
+
+    /**
+     * The {@code --summary-json} line: counts, ids, kinds and the document's whole accounting, never
+     * document text. v2's keys (the plan summary, status, unresolved count, provenance, timings,
+     * llm_usage), plus the unresolved findings' safe descriptions and the cost accounting.
+     */
+    static Map<String, Object> summaryJson(AnonymizeResult result) {
+        Map<String, Object> line = new LinkedHashMap<>(result.summary().asMap());
+        line.put("status", result.status());
+        line.put("unresolved_count", result.unresolvedCount());
+        line.put("fallback_used", result.fallbackUsed());
+        line.put("unresolved", result.unresolved().stream().map(UnresolvedFinding::asMap).toList());
+        line.put("provenance", result.provenance());
+        line.put("timings", result.timings());
+        line.put("llm_usage", result.llmUsage().asMap());
+        line.put("accounting", result.accounting().asMap());
+        return line;
+    }
+
+    /** The document's LLM cost in one line, then what makes its totals incomplete (v2's CLI lines). */
+    static void printUsage(PrintStream out, DocumentAccounting a) {
+        out.println("  llm_calls=" + a.calls() + " tokens_in=" + a.inputTokens() + " tokens_out=" + a.outputTokens()
+                + " tokens_total=" + a.totalTokens() + " cost=" + (a.estimatedCost() == null
+                ? "unavailable (" + a.costUnavailableReason() + ")" : a.estimatedCostText() + " " + a.currency()));
+        if (a.callsMissingUsage() > 0) {
+            out.println("  note: " + a.callsMissingUsage() + " call(s) reported no token usage, so the totals above "
+                    + "are incomplete");
+        }
+        for (LlmUsage.TruncatedCall call : a.usage().truncated()) {
+            out.println("  warning: chunk " + call.chunkNumber() + " " + call.kind().wire() + " hit the output limit ("
+                    + (call.outputTokens() == null ? "?" : call.outputTokens()) + "/" + call.limit()
+                    + " tokens) — raise ANON_MAX_COMPLETION_TOKENS");
+        }
+    }
+
+    /**
+     * One final event per document, in the HTTP service's shape (without the status it has no use
+     * for), with the document's accounting: from its result when there is one, otherwise from its
+     * context's ledger, so a document that failed still reports what it spent.
+     */
+    private static void logFinished(RunContext ctx, String outcome, long started, int unresolved, String errorCode,
+                                    DocumentAccounting accounting, RuntimeConfig runtime) {
+        long elapsedNanos = System.nanoTime() - started;
+        DocumentAccounting reported = accounting != null ? accounting
+                : DocumentAccounting.of(ctx.usage().snapshot(), elapsedNanos / 1_000_000, null, runtime.pricing());
+        LOG.info("document_finished {} outcome={} elapsed_s={} unresolved_count={} error_code={} {}", ctx.tag(),
+                outcome, PyFloat.fixed(elapsedNanos / 1e9, 2), unresolved, errorCode, reported.logFields());
+    }
+
+    // ------------------------------------------------------------------ main
+
+    /** True, with the regex-mode error printed, when there is no model: every .docx needs one. */
+    static boolean refusedInRegexMode(RuntimeConfig runtime, PrintStream err) {
+        if (runtime.provider() != RuntimeConfig.Provider.REGEX) {
+            return false;
+        }
+        err.println(RegexModeLlmClient.ERROR);
+        return true;
+    }
+
+    /** Runs the CLI and returns its exit code; never throws to the caller for expected failures. */
+    public static int run(String[] argv, PrintStream out, PrintStream err) {
+        Args args;
+        try {
+            args = parseArgs(argv, out, err);
+        } catch (ArgExit e) {
+            return e.code;
+        }
+
+        Path home = AppHome.resolve();
+        Config.loadEnvFile(home.resolve(".env"));
+
+        if (args.file() != null && !args.file().isEmpty() && args.input() != null && !args.input().isEmpty()) {
+            err.println("error: pass the input as either the positional argument or --file, not both");
+            return EXIT_USAGE;
+        }
+        String inputArg = args.file() != null && !args.file().isEmpty() ? args.file() : args.input();
+        if (inputArg == null || inputArg.isEmpty()) {
+            err.println("error: no input given (pass a path, or use --file <path>)");
+            return EXIT_USAGE;
+        }
+        Path inputPath = Path.of(inputArg);
+        List<Path> sources = collectInputs(inputPath);
+        if (sources.isEmpty()) {
+            err.println("error: no .docx input found at " + pyPath(inputPath));
+            return EXIT_USAGE;
+        }
+        Path outDir = args.outDir() != null && !args.outDir().isEmpty() ? Path.of(args.outDir()) : null;
+        if (outDir != null) {
+            try {
+                Files.createDirectories(outDir);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
+        Path configDir = args.configDir() != null && !args.configDir().isEmpty()
+                ? Path.of(args.configDir()) : home.resolve("config");
+
+        RuntimeConfig runtime;
+        FileConfig files;
+        LlmClient client;
+        try {
+            runtime = Config.loadRuntimeConfig();
+            if (refusedInRegexMode(runtime, err)) {
+                return EXIT_CONFIG;
+            }
+            files = Config.loadFileConfig(configDir);
+            client = LlmClients.build(runtime);
+        } catch (ConfigurationError e) {
+            err.println("configuration error: " + e.getMessage());
+            return EXIT_CONFIG;
+        }
+
+        int failures = 0;
+        int timeouts = 0;
+        int needsReview = 0;
+        try (client) {
+            for (Path source : sources) {
+                Path target = outputPath(source, outDir);
+                String name = source.getFileName().toString();
+                out.println("started: " + name);
+                RunContext ctx = RunContext.start(runtime.documentDeadlineS());
+                long started = System.nanoTime();
+                AnonymizeResult result;
+                try {
+                    result = Pipeline.anonymizeDocument(Files.readAllBytes(source), runtime, files, client, ctx);
+                } catch (DocumentTimeoutError e) {
+                    timeouts++;
+                    err.println("TIMED OUT  " + name + ": " + e.getMessage());
+                    err.println("  no file written to " + pyPath(target));
+                    logFinished(ctx, e.outcome(), started, 0, e.code(), null, runtime);
+                    continue;
+                } catch (ResidualPIIError e) {
+                    // Nothing is written: a document that failed its own check must not look like a result.
+                    needsReview++;
+                    err.println("NEEDS MANUAL REVIEW  " + name + ": " + e.getMessage());
+                    err.println("  no file written to " + pyPath(target));
+                    logFinished(ctx, e.outcome(), started, 0, e.code(), null, runtime);
+                    continue;
+                } catch (AnonymizerError e) {
+                    failures++;
+                    err.println("FAILED  " + name + ": " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                    logFinished(ctx, e.outcome(), started, 0, e.code(), null, runtime);
+                    continue;
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+                try {
+                    Files.write(target, result.redactedDocx());
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+                logFinished(ctx, result.needsReview() ? "needs_review" : "success", started, result.unresolvedCount(),
+                        "-", result.accounting(), runtime);
+                PlanSummary summary = result.summary();
+                out.println("done: " + pyPath(target));
+                if (result.needsReview()) {
+                    // The file IS written: nothing was invented for what the LLM could not settle, and a
+                    // person must look at these locations before publishing.
+                    out.println("  status=needs-review unresolved_count=" + result.unresolvedCount()
+                            + (result.fallbackUsed() ? " fallback_used=true" : "")
+                            + " — a person must settle these before publication");
+                    for (UnresolvedFinding finding : result.unresolved()) {
+                        String where = finding.locations().isEmpty() ? "no location — the finding could not be quoted"
+                                : finding.locations().stream().map(l -> l.unitId() + "[" + l.start() + ":" + l.end() + "]")
+                                        .collect(Collectors.joining(", "));
+                        String audit = finding.audit().stream().map(a -> a.severity() + " " + a.kind() + " "
+                                + a.phase() + ":" + a.findingId() + "@" + a.location()).collect(Collectors.joining(", "));
+                        out.println("    unresolved: chunk " + finding.chunkNumber() + " " + finding.kind().wire()
+                                + (finding.category() == null ? "" : " " + finding.category()) + " (" + where + ")"
+                                + (audit.isEmpty() ? "" : " from post-redaction " + audit));
+                    }
+                } else {
+                    out.println("  status=processed");
+                }
+                out.println("  spans=" + summary.spansTotal() + " by_action=" + PyRepr.repr(summary.byAction())
+                        + " model=" + result.model() + " elapsed="
+                        + PyFloat.fixed(result.timings().getOrDefault("total", 0.0), 1) + "s");
+                printUsage(out, result.accounting());
+                for (String warning : result.warnings()) {
+                    out.println("  warning: " + warning);
+                }
+                if (args.summaryJson()) {
+                    out.println(PyJson.dumps(summaryJson(result)));
+                }
+                if (args.qa()) {
+                    printQa(out, result.postcheck(), name);
+                }
+            }
+        }
+        if (failures > 0) {
+            return EXIT_PROCESSING_FAILED;
+        }
+        if (timeouts > 0) {
+            return EXIT_TIMEOUT;
+        }
+        if (needsReview > 0) {
+            return EXIT_QA_HIGH;
+        }
+        return EXIT_OK;
+    }
+
+    public static void main(String[] argv) {
+        AtomicBoolean finished = new AtomicBoolean(false);
+        PrintStream out = new PrintStream(System.out, true, StandardCharsets.UTF_8);
+        PrintStream err = new PrintStream(System.err, true, StandardCharsets.UTF_8);
+        // Ctrl+C: the JVM runs shutdown hooks and exits with 130 (128 + SIGINT), as the Python CLI does.
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            if (!finished.get()) {
+                err.println();
+                err.println("interrupted by user");
+            }
+        }));
+        int code = run(argv, out, err);
+        finished.set(true);
+        System.exit(code);
+    }
+}

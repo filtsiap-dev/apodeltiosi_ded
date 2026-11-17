@@ -1,0 +1,32 @@
+meta {
+  name: No personal data
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/anonymize-log
+  body: json
+  auth: bearer
+}
+
+headers {
+  Content-Type: application/json
+}
+
+auth:bearer {
+  token: {{apiKey}}
+}
+
+body:json {
+  {"session_id": "s1", "mode": "qa", "user_query": "επιδομα α21", "final_answer": "Ναι.", "status": "completed"}
+}
+
+tests {
+  test("the entry comes back unchanged", function() {
+    expect(res.status).to.equal(200);
+    expect(res.body.user_query).to.equal("επιδομα α21");
+    expect(res.getHeader("x-redaction-counts")).to.equal("none");
+    expect(res.getHeader("x-anonymization-status")).to.equal("anonymized");
+  });
+}

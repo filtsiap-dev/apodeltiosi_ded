@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- HTTP service profile: stdout, Python basicConfig layout, root level from ANON_LOG_LEVEL
+     (set by ApiServer as anonymizer.logLevel before logging starts). Never logs document text. -->
+<configuration>
+  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+    <target>System.out</target>
+    <encoder><pattern>%level:%logger:%msg%n%ex</pattern><charset>UTF-8</charset></encoder>
+  </appender>
+  <root level="${anonymizer.logLevel:-INFO}"><appender-ref ref="STDOUT"/></root>
+</configuration>

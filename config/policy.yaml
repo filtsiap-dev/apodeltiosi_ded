@@ -24,7 +24,9 @@ policy:
     - DECISION_METADATA
     - PERCENTAGE
     - FISCAL_PERIOD
-    # The structural label that introduces a value ("Α.Φ.Μ.", "ΑΤΑΚ", "οδός").
+    # The structural label that introduces a value ("Α.Φ.Μ.", "ΑΤΑΚ", "οδός"),
+    # and the generic party-role phrases ("η προσφεύγουσα εταιρεία", "ο νόμιμος
+    # εκπρόσωπος"), a closed grammatical class.
     # Hard because it is mechanically certain: a token only enters this
     # category if it can never itself be, or begin, personal data. This is what
     # stops an over-wide span taking the label along with the value.
@@ -33,6 +35,31 @@ policy:
     # κατάθεσης", "εκδόθηκε στις"). Note that DATE stays out, for the
     # reason above: only this one has been shown not to be a date of birth.
     - PROCEDURAL_DATE
+    # PUBLIC geography the rules have POSITIVELY identified, kept whole by the
+    # new gold: a municipality WITH its administrative region after a residence
+    # cue ("κατοίκου <municipality> Αττικής"), and the region after an
+    # authority's place ("Δήμου <place> <region>"). Only those two detectors
+    # emit it, and only for runs ending in an allowlists/regions.txt entry, so
+    # it cannot shield a name. (The authority's place itself is a PUBLIC_SERVICE
+    # preserve over the cue and the place, above.)
+    #
+    # The generic LOCALITY is deliberately NOT here, in either list: it is the
+    # category for a place whose role the context does not settle (a district
+    # or area name after "συνοικία"/"περιοχή" is an ordinary 0.85 proposal), and
+    # whatever a model labels LOCALITY, so it stays ordinary evidence for pass
+    # 2. A bare place after a residence cue ("κατοίκου Λαμίας") is the LLM's
+    # decision (the prompts keep the locality); the rules give it only an
+    # ordinary PRIVATE_ADDRESS proposal, which is the fallback when no usable
+    # LLM decision exists, and no locality span at all.
+    # (v2 lists LOCALITY as hard-REDACT instead: it blanks the toponym after an
+    # authority cue, which the new gold keeps as part of the institution's name.)
+    - PUBLIC_LOCALITY
+    # The final official signatory's NAME, and nothing else of the signature
+    # block: detectFinalSignatory emits it only after a signing title, on a
+    # line of its own, with no private-party cue in the block. Hard so that
+    # it is never redacted and never a pass-2 question (initial or
+    # post-redaction); a hard redact (an identifier) still outranks it.
+    - OFFICIAL_SIGNATORY
 
   # Hard redacts: if seen with confidence >= 0.9, no preserve can shield them
   hard_redact_categories:
@@ -45,13 +72,6 @@ policy:
     # cue-anchored and captures the value in group 1, so no PROPERTY_ID span can
     # ever cover the label that a hard preserve is protecting.
     - PROPERTY_ID
-    # The toponym after an AUTHORITY cue — "Δήμου Χαλκιδέων", "Πρωτοδικείου
-    # Χαλκίδας". Hard ONLY at confidence 1.0, which only the authority-cued
-    # pattern emits: a district or area name ("συνοικία Η΄ Χαλκίδας") is scored
-    # 0.85 by the same detector and stays an ordinary proposal for pass 2, which
-    # is what the gold does with it. A Δ.Ο.Υ. name carries no locality cue and
-    # is therefore untouched by this tier.
-    - LOCALITY
 
   preserve_email_domains:
     - aade.gr

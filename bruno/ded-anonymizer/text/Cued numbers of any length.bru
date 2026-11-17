@@ -1,0 +1,56 @@
+meta {
+  name: Cued numbers of any length
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{baseUrl}}/anonymize-text
+  body: text
+  auth: bearer
+}
+
+headers {
+  Content-Type: text/plain; charset=utf-8
+}
+
+auth:bearer {
+  token: {{apiKey}}
+}
+
+body:text {
+  Καλησπέρα, με αφμ 1212121, ΑΜΚΑ 123456, τηλ 69123456 και ΑΔΤ ΑΚ 12345.
+}
+
+tests {
+  test("returns 200", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("every number after its cue is masked, whatever its length", function() {
+    expect(res.body).to.not.include("1212121");
+    expect(res.body).to.not.include("123456");
+    expect(res.body).to.not.include("69123456");
+    expect(res.body).to.not.include("12345");
+    expect(res.body).to.not.include("ΑΚ");
+  });
+  test("the cue words stay visible", function() {
+    expect(res.body).to.include("αφμ .......");
+    expect(res.body).to.include("ΑΜΚΑ ......");
+    expect(res.body).to.include("τηλ ........");
+    expect(res.body).to.include("ΑΔΤ .. .....");
+  });
+  test("headers name each type and need no review", function() {
+    const counts = res.getHeader("x-redaction-counts");
+    expect(res.getHeader("x-anonymization-status")).to.equal("anonymized");
+    expect(counts).to.include("AFM=1");
+    expect(counts).to.include("AMKA=1");
+    expect(counts).to.include("PHONE=1");
+    expect(counts).to.include("ID_CARD=1");
+  });
+}
+
+docs {
+  After an ID's name (ΑΦΜ, ΑΜΚΑ, ΑΔΤ/ταυτότητα, διαβατήριο, τηλ/τηλέφωνο/κινητό, IBAN) the next number is masked
+  even when its length or checksum is wrong. Up to 25 characters with no digit and no line break may sit between
+  them ("ΑΦΜ μου είναι 1212121"). The cue word stays visible. "ΑΚ" is also counted as PERSON by the name rule.
+}

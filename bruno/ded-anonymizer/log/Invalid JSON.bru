@@ -1,0 +1,30 @@
+meta {
+  name: Invalid JSON
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/anonymize-log
+  body: text
+  auth: bearer
+}
+
+headers {
+  Content-Type: application/json
+}
+
+auth:bearer {
+  token: {{apiKey}}
+}
+
+body:text {
+  {"session_id": "s1", "user_query": "abc"
+}
+
+tests {
+  test("a body that is not one JSON object is refused", function() {
+    expect(res.status).to.equal(400);
+    expect(res.body.code).to.equal("INVALID_JSON");
+  });
+}

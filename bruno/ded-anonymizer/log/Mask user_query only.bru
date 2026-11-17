@@ -1,0 +1,81 @@
+meta {
+  name: Mask user_query only
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/anonymize-log
+  body: json
+  auth: bearer
+}
+
+headers {
+  Content-Type: application/json
+}
+
+auth:bearer {
+  token: {{apiKey}}
+}
+
+body:json {
+  {
+    "session_id": "session_0000000000000_example",
+    "timestamp": "2026-10-13T14:04:04.221110930Z",
+    "mode": "qa",
+    "user_query": "Λέγομαι Ελένη Κωνσταντίνου και το ΑΜΚΑ μου είναι 15038501233",
+    "topk_retrieved_payload": [
+      {
+        "id": 2000305375,
+        "chunkNo": 1,
+        "carrierId": 12,
+        "similarity": 0.8123456789012345,
+        "textScore": null,
+        "title": "Διαδικαστικά Ζητήματα",
+        "content": "Ερώτηση: Κάθε πότε υποβάλλω αίτηση;\nΑπάντηση: Μία φορά ετησίως.",
+        "extractedFacts": ["Η αίτηση υποβάλλεται μία φορά ετησίως"],
+        "thematicChain": [
+          {"level": 1, "id": 7, "label": "Επιδόματα", "type": "theme"}
+        ]
+      }
+    ],
+    "retrieved_information_for_final_answer": {
+      "context": "Η αίτηση υποβάλλεται μέσω της πλατφόρμας."
+    },
+    "final_answer": "Μπορείτε να υποβάλετε αίτηση μία φορά ετησίως.",
+    "status": "completed"
+  }
+}
+
+tests {
+  test("returns 200 as JSON", function() {
+    expect(res.status).to.equal(200);
+    expect(res.getHeader("content-type")).to.include("application/json");
+  });
+  test("only user_query is masked", function() {
+    expect(res.body.user_query).to.not.include("Ελένη");
+    expect(res.body.user_query).to.not.include("Κωνσταντίνου");
+    expect(res.body.user_query).to.not.include("15038501233");
+    expect(res.body.user_query).to.include("Λέγομαι");
+  });
+  test("every other field is unchanged", function() {
+    expect(res.body.session_id).to.equal("session_0000000000000_example");
+    expect(res.body.timestamp).to.equal("2026-10-13T14:04:04.221110930Z");
+    expect(res.body.status).to.equal("completed");
+    expect(res.body.final_answer).to.equal("Μπορείτε να υποβάλετε αίτηση μία φορά ετησίως.");
+    expect(res.body.topk_retrieved_payload[0].similarity).to.equal(0.8123456789012345);
+    expect(res.body.topk_retrieved_payload[0].textScore).to.equal(null);
+    expect(res.body.topk_retrieved_payload[0].content).to.include("Απάντηση: Μία φορά ετησίως.");
+  });
+  test("headers report what was masked", function() {
+    expect(res.getHeader("x-anonymization-status")).to.equal("anonymized");
+    expect(res.getHeader("x-redaction-counts")).to.include("PERSON=2");
+    expect(res.getHeader("x-redaction-counts")).to.include("AMKA=1");
+  });
+}
+
+docs {
+  One log entry per request. Only the top-level "user_query" string is masked; the rest of the body comes back
+  byte for byte (field order, number formatting and escapes included; Bruno re-parses it, so the tests compare
+  values). A "user_query" nested inside another object is left alone.
+}

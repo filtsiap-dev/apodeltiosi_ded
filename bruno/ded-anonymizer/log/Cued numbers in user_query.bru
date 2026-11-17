@@ -1,0 +1,49 @@
+meta {
+  name: Cued numbers in user_query
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{baseUrl}}/anonymize-log
+  body: json
+  auth: bearer
+}
+
+headers {
+  Content-Type: application/json
+}
+
+auth:bearer {
+  token: {{apiKey}}
+}
+
+body:json {
+  {
+    "session_id": "session_0000000000000_example",
+    "user_query": "Θέλω ραντεβού. Το ΑΜΚΑ μου είναι 123456 και το κινητό μου 69123456",
+    "final_answer": "Το ΑΜΚΑ 123456 καταχωρήθηκε.",
+    "status": "completed"
+  }
+}
+
+tests {
+  test("the short ΑΜΚΑ and phone in user_query are masked", function() {
+    expect(res.status).to.equal(200);
+    expect(res.body.user_query).to.equal("Θέλω ραντεβού. Το ΑΜΚΑ μου είναι ...... και το κινητό μου ........");
+  });
+  test("every other field is unchanged", function() {
+    expect(res.body.final_answer).to.equal("Το ΑΜΚΑ 123456 καταχωρήθηκε.");
+    expect(res.body.session_id).to.equal("session_0000000000000_example");
+    expect(res.body.status).to.equal("completed");
+  });
+  test("headers report what was masked", function() {
+    expect(res.getHeader("x-anonymization-status")).to.equal("anonymized");
+    expect(res.getHeader("x-redaction-counts")).to.equal("AMKA=1,PHONE=1");
+  });
+}
+
+docs {
+  The cue rule through the log endpoint: a 6-digit ΑΜΚΑ and an 8-digit phone after their cue words are masked in
+  user_query only.
+}

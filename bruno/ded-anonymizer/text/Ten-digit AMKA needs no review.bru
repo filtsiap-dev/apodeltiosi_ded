@@ -1,0 +1,40 @@
+meta {
+  name: Ten-digit AMKA needs no review
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{baseUrl}}/anonymize-text
+  body: text
+  auth: bearer
+}
+
+headers {
+  Content-Type: text/plain; charset=utf-8
+}
+
+auth:bearer {
+  token: {{apiKey}}
+}
+
+body:text {
+  Το ΑΜΚΑ μου είναι 1989992121
+}
+
+tests {
+  test("the number is masked and the cue stays", function() {
+    expect(res.status).to.equal(200);
+    expect(res.body).to.include("Το ΑΜΚΑ μου είναι ..........");
+  });
+  test("it is anonymized, not needs-review", function() {
+    expect(res.getHeader("x-anonymization-status")).to.equal("anonymized");
+    expect(res.getHeader("x-redaction-counts")).to.equal("AMKA=1");
+    expect(res.getHeader("x-review-reasons")).to.be.undefined;
+  });
+}
+
+docs {
+  A 10-digit ΑΜΚΑ (one digit short) used to be caught only by the residual safety net, which answers
+  needs-review. The cue rule now masks it, so the status is anonymized.
+}

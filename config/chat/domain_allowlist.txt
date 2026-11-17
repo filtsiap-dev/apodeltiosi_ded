@@ -1,0 +1,96 @@
+# Terms of OUR services and of the systems customers mention, which must never be masked.
+# Grow this from reviewed output: a term masked by the uncommon-word rule belongs here.
+# Folded on load (case and accents do not matter). '#' starts a comment.
+# Public bodies, Greek acronyms and ID labels
+δεη
+ευδαπ
+εφκα
+ααδε
+δυπα
+οαεδ
+κεπ
+δου
+αφμ
+αμκα
+γεμη
+αδτ
+τκ
+ικα
+οτε
+ελτα
+ερτ
+εκασ
+οπεκα
+κεπα
+κεα
+ασεπ
+ογα
+εοπυυ
+αμεα
+δοατααπ
+efka
+aade
+dypa
+opeka
+oaed
+kep
+ika
+gov
+# Tax terms and systems
+ενφια
+taxisnet
+mydata
+myaade
+myefka
+enfia
+# Telecom and IT
+cosmote
+vodafone
+nova
+wind
+email
+mail
+wifi
+router
+modem
+app
+android
+iphone
+ios
+windows
+viber
+whatsapp
+messenger
+facebook
+instagram
+google
+gmail
+yahoo
+outlook
+sms
+pin
+puk
+fiber
+vdsl
+adsl
+ftth
+mbps
+online
+chatbot
+samsung
+galaxy
+huawei
+xiaomi
+latin
+# Payments
+iban
+swift
+bic
+visa
+mastercard
+paypal
+# Units and abbreviations used in benefit questions
+τμ
+kwh
+kw
+χλμ

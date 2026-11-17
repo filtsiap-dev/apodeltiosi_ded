@@ -1,789 +1,616 @@
-# `ded-anonymizer`
+# ded-anonymizer (Java)
 
-Anonymizes Greek ΑΑΔΕ/ΔΕΔ tax-decision Word documents before public release.
+Anonymizes Greek ΑΑΔΕ / ΔΕΔ tax-decision documents (`.docx`). Personal data (names, ΑΦΜ,
+ΑΜΚΑ, IBAN, e-mails, private addresses, case identifiers …) is replaced character for
+character with `.`, so layout and length are unchanged. Every output goes through a mandatory
+residual-PII scan. Located initial-scan findings in document text (a surviving ΑΦΜ, phone, name,
+property identifier …) are put back to the LLM's adjudicating pass against the redacted document,
+and its answers are applied. A HIGH-severity text finding (ΑΦΜ, ΑΜΚΑ, IBAN, e-mail, property
+identifier) is settled only by being redacted: if the model answers PRESERVE, the file keeps the
+value as it decided but comes back `needs-review`. A HIGH finding without a text span (a macro,
+tracked change, comment, or placeholder left by the write path) stops the document, and nothing
+is written or returned. MEDIUM package warnings remain visible in the audit.
 
-Every document goes through the same pipeline, whether it arrives over HTTP or
-through the CLI:
-
-```
-normalize -> parse -> screen -> detect -> llm -> resolve -> apply -> scan
-                                                                      |
-                                        residual text? -> pass 2 -> resolve -> apply
-```
-
-Deterministic detectors and a mandatory two-pass LLM reading both look at the
-text; a resolver settles what they disagree about; the plan is applied back to
-the package byte-verbatim; and an independent scan checks the *output* for
-residual personal information before anything is returned.
-
-**The scan runs exactly once, and it is not only a gate.** What it finds in the
-document's *text* goes back to LLM pass 2 as an ordinary question — the exact
-slice, in the redacted document, with the whole chunk in view — and pass 2's
-answer goes through the same resolver and a second apply. What it finds in the
-document's *package* (a surviving macro, a tracked change, a comment part) is
-nothing a model can decide, and a HIGH one of those still refuses the document.
-Nothing re-scans the correction, so there is no loop: one audit, one re-ask, and
-the file is returned.
-
-**One document per request, and one per CLI invocation.** The HTTP body is the
-document in both directions — DOCX bytes in, redacted DOCX bytes out, no
-envelope, no base64, nothing to decode.
-
-**Human review is part of the workflow.** A document can come back
-`needs-review`: a success, with a complete file, and one or more places a person
-must settle before publication. See [Needs-review](#needs-review-is-a-success).
-
----
+Pipeline: validate → parse DOCX → prompt-injection screen → deterministic detectors → two-pass
+LLM review (a REDACT the model draws is narrowed to its value) → resolve → length-preserving
+write-back → metadata cleanup (author, comments, tracked changes, hidden text, custom
+properties) → residual-PII scan → remediation (LLM pass 2 only, over the redacted text; resolve;
+write-back) → deterministic final scan when remediation writes. There is one remediation round;
+the final scan never calls a model.
 
 ## What is and is not guaranteed
 
-**In scope.** Text in the document body, tables, headers, footers, footnotes and
-endnotes. That text is read by both detection paths and redacted in place.
+**In scope:** the text of the body, tables, headers, footers, footnotes and endnotes. Both
+detection paths read it and it is redacted in place.
 
-**Out of scope, explicitly.** This service does **not** anonymize the package
-*surface*: document properties (`docProps/core.xml` title, author, subject,
-description), hyperlink targets, custom XML parts, or field codes. Personal
-information there survives into the output. If your documents carry PII in those
-places, strip it before or after this service — the post-redaction scan reports
-some of it as a non-blocking finding, but nothing here removes it.
+**Out of scope, as in v2:** the package *surface*. Document properties other than those cleaned
+below (`docProps/core.xml` subject and description), hyperlink targets (a `mailto:` behind a
+redacted link text keeps the address), custom XML parts and field codes are not anonymized, and
+personal data there survives into the output. Strip it before or after this service if your
+documents carry it there.
 
-**Document author metadata is preserved, deliberately.** `dc:creator` and
-`cp:lastModifiedBy` in `docProps/core.xml` are carried through to the output
-unchanged, and the post-redaction scan does not fail a document for them. This
-is a **ΔΕΔ-compatibility decision, not a privacy guarantee**: the published gold
-decisions keep both fields — `dc:creator` reads `user` and `cp:lastModifiedBy`
-carries the name of the clerk who prepared the file — and matching that output
-is the requirement this service is held to.
+Unlike v2, which keeps `dc:creator` and `cp:lastModifiedBy` because the published golds do, this
+application blanks both, together with title, keywords and category.
 
-A future `cp:lastModifiedBy` can hold a real person's name. It is not text the
-detectors ever see, and nothing downstream removes it. A deployment that needs
-the stronger behaviour must add both names back to the blank list in
-`docx_engine._cleanup_core_properties` **and** restore the matching HIGH
-findings in `anonymizer/postcheck.py`; the docstrings in both places say so.
-`dc:title`, `cp:keywords` and `cp:category` are still blanked, and the
-created/modified timestamps are still pinned to a fixed epoch.
+## Requirements
 
-**No global concurrency limit.** Each document is bounded (see
-[Resource limits](#resource-limits)), but nothing caps how many documents the
-process handles at once. Size your deployment with `WEB_CONCURRENCY` and the
-per-document ceilings in mind.
+- JDK 24 (what CI tests and the Docker image runs; the code compiles for 21), Maven 3.9+
+- An OpenAI or Azure OpenAI deployment (the LLM stage is mandatory)
 
----
+## Build
 
-## Accepted input
+```
+mvn verify          # compile + unit tests
+mvn clean verify    # target/ded-anonymizer-2.0.0.jar, dependencies included in the shaded JAR
+```
 
-Four OOXML Word formats:
+Ship `target/ded-anonymizer-2.0.0.jar` together with the `config/` folder. The manifest entrypoint is the HTTP server.
 
-| Extension | Media type |
+## Command line
+
+```
+java -cp target/ded-anonymizer-2.0.0.jar dev.filtsiap.ded.RunAnonymizer decision.docx
+java -cp target/ded-anonymizer-2.0.0.jar dev.filtsiap.ded.RunAnonymizer --file C:\decisions --out-dir redacted --qa --summary-json
+```
+
+A folder is processed non-recursively; outputs are named `<name>_redacted.docx`.
+`--qa` prints findings for the returned bytes. Audit references `P<n>` identify the initial scan; `F<n>` identify the final scan. They carry their scan phase, kind and location and are not interchangeable QA row numbers. `--summary-json` prints one JSON
+line per document with counts, ids and kinds only, never document text: the plan summary, status,
+the unresolved findings (kind, category, location, and the scan finding behind each), provenance,
+stage timings, the LLM ledger (`llm_usage`) and the cost accounting (`accounting`, see below).
+
+Exit codes: `0` all done · `1` a document failed · `2` usage error · `3` configuration error ·
+`4` a document was blocked by a non-text scan finding and needs manual review · `5` a document ran
+out of its processing budget (`ANON_DOCUMENT_DEADLINE_S`; nothing is written for it) ·
+`130` interrupted. With several documents the lowest of `1`, `5`, `4` that occurred wins.
+
+## HTTP service
+
+```
+java -cp target/ded-anonymizer-2.0.0.jar dev.filtsiap.ded.api.ApiServer
+```
+
+| Endpoint | |
 |---|---|
-| `.docx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` |
-| `.docm` | `application/vnd.ms-word.document.macroEnabled.12` |
-| `.dotx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.template` |
-| `.dotm` | `application/vnd.ms-word.template.macroEnabled.12` |
-
-The output is always a `.docx`.
-
-**Legacy binary `.doc` and `.dot` are not supported.** They are a different file
-format (OLE2, not a ZIP), and they are rejected with `415`. Open them in Word
-and save as `.docx` first. There is no converter in this service and no
-LibreOffice dependency.
-
-**Macro-enabled input is accepted and de-macroed.** A `.docm` or `.dotm` is
-normalised to a plain `.docx`: the VBA parts (`word/vbaProject.bin`,
-`word/vbaData.xml` and their relationships) are removed rather than carried
-through, and settings that would update content from external sources on open
-are disabled. The output never executes macros. If a macro part somehow survived
-normalisation, the post-redaction scan raises a HIGH finding and the document is
-refused rather than returned — see [The post-redaction scan](#the-post-redaction-scan).
-
-### The package is validated before any work starts
-
-* the upload must be a readable ZIP whose central directory is consistent;
-* `[Content_Types].xml` and `_rels/.rels` must be present and parse;
-* the officeDocument relationship must resolve to a main part whose declared
-  content type matches the format;
-* `word/document.xml` is parsed **strictly**, with XML recovery off: it must be
-  valid XML, its root must be `w:document`, and it must contain a `w:body`.
-
-The strict parse is the one that matters most. A damaged file can contain every
-expected filename; without it, the main document would be *recovered* into
-nothing, the redaction plan would be empty, and the file would come back looking
-anonymized although it was never read. A valid document with no text is fine —
-this rejects unreadable input, not empty input.
-
-Other parts keep a recovering parser, so a damaged header does not fail an
-otherwise readable document.
-
----
-
-## Quick start
-
-### 1. Install
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-For development (tests, linting, type checking):
-
-```powershell
-pip install -e ".[dev]"
-```
-
-### 2. Fill in `.env`
-
-The `.env` file next to `run_anonymizer.py` is loaded automatically by both
-entry points. Real environment variables always win; the file only fills in what
-is missing.
-
-**OpenAI:**
-
-```ini
-ANON_PROVIDER=openai
-OPENAI_API_KEY=sk-...
-ANON_MODEL=gpt-4o
-ANON_API_KEY=a-long-random-string    # required by the HTTP API only
-```
-
-**Azure OpenAI:**
-
-```ini
-ANON_PROVIDER=azure
-AZURE_OPENAI_API_KEY=...
-AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
-ANON_AZURE_DEPLOYMENT=your-deployment-name
-ANON_AZURE_API_VERSION=2024-02-01
-ANON_API_KEY=a-long-random-string
-```
-
-The service **refuses to start** if any of this is missing, blank, or
-nonsensical. See [Startup validation](#startup-validation).
-
-### 3. Run
-
-```powershell
-# one document
-python .\run_anonymizer.py .\decision.docx
-
-# the HTTP API
-python -m uvicorn anonymizer.api:app --host 0.0.0.0 --port 8000
-```
-
----
-
-## Running as a CLI
-
-**One document per invocation.** There is no folder mode: the shell already has
-a loop, and it composes better than anything this script could offer.
-
-```powershell
-# output next to the input, as <stem>_redacted.docx
-python .\run_anonymizer.py .\decision.docx
-
-# name the output file
-python .\run_anonymizer.py .\decision.docx --out .\redacted\clean.docx
-
-# --file is equivalent to the positional argument
-python .\run_anonymizer.py --file .\decision.docx
-
-# several documents: loop in the shell
-Get-ChildItem *.docx | ForEach-Object { python .\run_anonymizer.py $_.FullName }
-```
-
-### Flags
-
-| Flag | Meaning |
-|---|---|
-| `<path>` or `--file <path>` | the one document to process; give exactly one of the two |
-| `--out <path>` | output **file** path (default: `<stem>_redacted.docx` beside the input). Parent directories are created. |
-| `--config-dir <path>` | directory holding `policy.yaml`, `regex_patterns.yaml`, `prompt_injection.yaml`, `allowlists/` (default: `config/` next to the script) |
-| `--qa` | print every finding of the post-redaction scan. The scan always runs; this only makes it verbose. |
-| `--summary-json` | print the counts-only summary as one JSON line |
-
-### The output is written atomically
-
-The bytes go to a temporary file **in the destination directory**, are flushed
-and `fsync`ed, and only then replace the destination in one operation. A crash,
-a full disk or a Ctrl+C therefore leaves either the previous file or no file —
-never a half-written DOCX that looks like a result. A failed write cannot
-truncate an output that was already there.
-
-`--out` overwrites an existing file without asking.
-
-### Exit codes
-
-| Code | Meaning |
-|---|---|
-| 0 | processed — **including `needs-review`**, where the file *was* written |
-| 1 | processing failed, or the input could not be read / the output written |
-| 2 | usage error (see below) |
-| 3 | configuration error |
-| 4 | blocked by the post-redaction scan; **nothing was written** |
-| 5 | the document exceeded its end-to-end budget |
-| 130 | interrupted (Ctrl+C) |
-
-Five distinct usage errors, because the fix differs in each case: both argument
-forms given, neither given, the path does not exist, the path is not a regular
-file, or the extension is outside the four accepted formats. **A directory** is
-named specifically — that used to be folder mode.
-
----
-
-## Running as an HTTP API
-
-### Production
-
-```powershell
-gunicorn -c gunicorn.conf.py anonymizer.api:app
-```
-
-`gunicorn.conf.py` reads `ANON_HOST`, `ANON_PORT` and `WEB_CONCURRENCY`, logs
-access lines to stdout, and sets a worker `timeout` of **900 seconds**. That is
-three times the 300-second document budget, so gunicorn is a backstop rather
-than the thing that ends a slow document. Lowering it to something nearer the
-budget is a reasonable deployment change.
-
-### Development
-
-```powershell
-python -m uvicorn anonymizer.api:app --reload
-```
-
-See [RUN_SERVICE.md](RUN_SERVICE.md) for Python installation and service startup.
-
-### `POST /anonymize`
-
-**The body is the document, in both directions.**
+| `POST /anonymize` | `Authorization: Bearer <ANON_API_KEY>`, `Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document`, the raw `.docx` bytes as the body. Returns `200` with the redacted DOCX bytes as the body: no form, no field name, no JSON, no base64. Any other content type (`multipart/form-data` and `application/octet-stream` included) is refused with `415`. |
+| `GET /healthz` | unauthenticated liveness probe: `{"status", "provider", "model"}` |
 
 ```
-POST /anonymize
-Authorization: Bearer <ANON_API_KEY>
-Content-Type: <one of the four media types above>
-
-<the raw document bytes>
+curl.exe -X POST http://localhost:8000/anonymize -H "Authorization: Bearer $key" -H "Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document" --data-binary "@decision.docx" -D headers.txt -o decision_redacted.docx
 ```
 
-Success is `200` with the redacted DOCX as the body. There is no form, no field
-name, no envelope, no base64. `multipart/form-data` and
-`application/octet-stream` are **refused with 415** — three ways in meant three
-code paths and three sets of failure modes for the same bytes.
-
-**Authentication happens before the body is touched.** The route declares no
-body parameter, because FastAPI parses the body *before* it solves dependencies;
-an unauthenticated request never has its upload read, spooled or processed.
-
-#### Response headers
+Response headers on success (ids, an enum and counts only, never document text):
 
 | Header | Value |
 |---|---|
-| `X-Document-ID` | opaque per-document id; every log line for this request carries it |
-| `X-Anonymization-Status` | `processed` or `needs-review` |
+| `X-Document-ID` | opaque per-document id (not the filename), also returned on errors after authentication; pipeline/final logs use it |
+| `X-Anonymization-Status` | `processed`, or `needs-review`: the file is complete but a person must check the unresolved locations (from the LLM review or its post-scan remediation) before publishing |
 | `X-Unresolved-Count` | integer |
-| `X-Postcheck-Findings` | total non-blocking findings from the output scan |
-| `X-Postcheck-Kinds` | per-kind breakdown, e.g. `embedded_object=1` |
+| `X-LLM-Fallback-Used` | `true`, only when LLM pass 2 was unavailable for some candidates after its retries and the documented fallback decided them (or left them undecided); always with `needs-review`. Absent otherwise |
+| `X-Postcheck-Findings`, `X-Postcheck-Kinds` | the deterministic scan of the returned bytes, e.g. `phone_shape=1` |
+| `X-Processing-Time-Ms`, `X-LLM-Time-Ms` | elapsed since authentication/input reading through the pipeline, and wall time of the LLM stage plus remediation calls; excludes sending the response |
+| `X-LLM-Calls`, `X-LLM-Calls-Missing-Usage` | provider responses, and how many of them reported no token usage |
+| `X-LLM-Input-Tokens`, `X-LLM-Output-Tokens`, `X-LLM-Total-Tokens` | token totals; sent only when every response reported its usage |
+| `X-LLM-Cached-Input-Tokens`, `X-LLM-Reasoning-Tokens` | sent only when the provider reported them |
+| `X-LLM-Estimated-Cost`, `X-LLM-Cost-Currency` | the document's cost as an exact decimal; sent only when prices are configured and every response reported usage |
 | `Content-Disposition` | `attachment; filename="<document id>_redacted.docx"` |
 
-Every value is an id, an enum or an integer. Nothing here is derived from the
-document's text — headers reach proxy access logs that the body's protections do
-not cover.
-
-The `X-Document-ID` is **not** the filename and not a hash of the content. It is
-a fresh opaque id per request. Quote it when reporting a problem: it is how an
-operator finds everything that happened to your document.
-
-### `GET /healthz`
-
-Unauthenticated liveness probe. Returns `{"status", "provider", "model"}` — no
-secret.
-
----
-
-## Needs-review is a success
-
-`X-Anonymization-Status: needs-review` is an **HTTP 200 with a complete file in
-the body**, and CLI **exit 0** with the file written.
-
-It means the LLM's second pass could not settle one or more findings even after
-its corrective retry. Nothing was invented for those: the places were left
-exactly as they were, and the deterministic rules still applied wherever they
-had evidence. The document is built only from evidence that was validated.
-
-**A person must look at those places before the document is published.**
-`X-Unresolved-Count` says how many; the CLI prints each one's chunk, kind and
-`(unit_id, start, end)` location. The text is never reported — only where to
-look.
-
-> An integrator who treats `200` as "done" will publish documents nobody
-> checked. Read the header.
-
-This is distinct from **exit 4 / HTTP 422** (`ResidualPIIError`), which is the
-harder failure: the output scan found a HIGH-severity problem that no further
-redaction can settle — a surviving macro, a tracked change, a comment part,
-residue of the write path — so **nothing is written or returned at all**.
-HIGH-severity *text* that survived does not end up here: it is put back to pass 2
-first (see [The post-redaction scan](#the-post-redaction-scan)).
-
----
-
-## The five-minute deadline
-
-Every document gets an end-to-end budget, default **300 seconds**
-(`ANON_DOCUMENT_DEADLINE_S`), started the moment the request authenticates and
-covering the upload, every stage, every provider call and every retry sleep.
-
-Exceeding it is **HTTP 504** / CLI **exit 5**, and no document is returned.
-
-The budget is enforced in four places rather than one:
-
-* between stages, at each of the eight boundaries — including once more before
-  the response is built, so a document finished at 300.2 s is a 504 rather than
-  a return;
-* in the LLM collector, which waits only as long as the budget allows;
-* per provider call, as `timeout = min(ANON_LLM_TIMEOUT_S, remaining)`, so a
-  call already in flight ends *at* the deadline;
-* before each retry sleep, which only starts if there is room for the call
-  after it.
-
-**What cancellation cannot do**, stated plainly: a Python thread cannot be
-killed, so after a 504 a worker already inside a provider call runs until that
-call's own (already-bounded) timeout and may write one or two attributable log
-lines afterwards. CPU-bound stages are not preemptible; they are bounded by the
-resource limits instead. And a client that connects but sends nothing leaves the
-body read waiting on the transport, where gunicorn's 900-second worker timeout
-is the only backstop.
-
----
-
-## Resource limits
-
-Every one is finite, validated at startup, and overridable. The defaults were
-calibrated against a real decision (166 KB upload, 23 members, 1.1 MB expanded,
-7:1 overall, 211 text units, 38,000 characters, 19 chunks).
-
-| Limit | Default | Variable | Headroom |
-|---|---|---|---|
-| Upload | 20,000,000 bytes | `ANON_MAX_UPLOAD_BYTES` | 120× |
-| ZIP members | 500 | `ANON_MAX_ZIP_MEMBERS` | 22× |
-| Member expanded | 25,000,000 bytes | `ANON_MAX_ZIP_MEMBER_BYTES` | 61× |
-| Total expanded | 60,000,000 bytes | `ANON_MAX_ZIP_TOTAL_BYTES` | 53× |
-| Compression ratio | 50:1 | `ANON_MAX_COMPRESSION_RATIO` | — |
-| Ratio floor | 1,000,000 bytes | `ANON_COMPRESSION_RATIO_FLOOR_BYTES` | members below this are not ratio-checked |
-| Extracted text | 400,000 chars | `ANON_MAX_TEXT_CHARS` | 10× |
-| Chunks | 150 | `ANON_MAX_CHUNKS` | 8× |
-
-Exceeding any of them is **HTTP 413**.
-
-The ZIP is checked from its **central directory first** — member count, declared
-sizes and compression ratios are read as metadata, before a single byte is
-decompressed — and members are then read with a bounded reader that also
-validates CRCs. A zip bomb is refused on its own declarations.
-
-Two limits can bind at different points: every table becomes its own chunk
-regardless of size, so a table-heavy document can exceed 150 chunks while under
-400,000 characters. Both are 413 with distinguishable codes.
-
-> `ANON_MAX_UPLOAD_MB` **no longer exists** and is not aliased. Setting it has
-> no effect — the default 20,000,000-byte limit stays in force. Use
-> `ANON_MAX_UPLOAD_BYTES`.
-
----
-
-## Configuration reference
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `ANON_PROVIDER` | `openai` | `openai` or `azure` |
-| `OPENAI_API_KEY` | — | required when `ANON_PROVIDER=openai` |
-| `ANON_MODEL` | — | required when `ANON_PROVIDER=openai` |
-| `AZURE_OPENAI_API_KEY` | — | required when `ANON_PROVIDER=azure` |
-| `AZURE_OPENAI_ENDPOINT` | — | required when `ANON_PROVIDER=azure`; must be an absolute http(s) URL |
-| `ANON_AZURE_DEPLOYMENT` | — | required when `ANON_PROVIDER=azure` |
-| `ANON_AZURE_API_VERSION` | — | required when `ANON_PROVIDER=azure` |
-| `ANON_API_KEY` | — | bearer credential for the HTTP API; the API refuses to start without it. The CLI does not need it. |
-| `ANON_DOCUMENT_DEADLINE_S` | `300.0` | end-to-end budget per document |
-| `ANON_LLM_TIMEOUT_S` | `60.0` | per provider call |
-| `ANON_CHUNK_SIZE_CHARS` | `3000` | target chunk size |
-| `ANON_MAX_COMPLETION_TOKENS` | `3000` | output ceiling per call |
-| `ANON_LLM_CONCURRENCY` | `8` | chunk worker threads |
-| `ANON_LOG_LEVEL` | `INFO` | application log level |
-| the eight limits above | see table | resource ceilings |
-
-Gunicorn-only: `ANON_HOST`, `ANON_PORT`, `WEB_CONCURRENCY`,
-`ANON_GUNICORN_TIMEOUT`, `ANON_GRACEFUL_TIMEOUT`.
-
-### Startup validation
-
-A configuration mistake found at startup costs one restart. The same mistake
-found at request time costs a user their document and produces a 500 or 502 that
-looks like a provider problem. So the loaders check, before the service accepts
-anything:
-
-* the selected provider's credentials are present and **not whitespace** — three
-  spaces passes a truthiness test, reaches the provider and fails there;
-* `AZURE_OPENAI_ENDPOINT` is an absolute http(s) URL (a plaintext `http`
-  endpoint warns that document text will cross the network in the clear);
-* every numeric knob is finite, positive, and within a sane ceiling. Zero is
-  refused as firmly as negative — a timeout of zero is a call that cannot be
-  made. `nan` gets its own mention: every comparison against it is False, so a
-  NaN limit silently *disables* the check it names;
-* the resource limits are mutually coherent (a member ceiling above the total
-  ceiling is a limit that can never fire, while the operator believes otherwise);
-* `policy.yaml` parses, its thresholds are numbers between 0 and 1 in the right
-  order, and its hard categories exist and are not in both lists;
-* every regex override in `regex_patterns.yaml` compiles **in every context the
-  detectors interpolate it into** — a fragment that compiles alone can change
-  meaning once wrapped;
-* every rule in `prompt_injection.yaml` compiles, is uniquely named, and does
-  not match the empty string;
-* `ANON_LOG_LEVEL` is a real level, so it never reaches `basicConfig` and dies
-  there;
-* any malformed YAML is a `ConfigurationError` naming the file and the line, not
-  a parser traceback.
-
-**No error message ever contains a secret's value.** They name the variable.
-
----
-
-## The two LLM passes
-
-Both passes read the *same rendering* of a chunk, so they cannot disagree about
-what the chunk is.
-
-### Pass 1 — blind discovery
-
-The **only** input is the chunk's own text. No rule spans, no REVIEW hints, no
-hard-preserve knowledge, no prior candidates, no resolver output. The two
-detection paths have to stay independent for their agreement to mean anything.
-
-Pass 1 is **evidence, not a gate**. Every unusable response degrades to "no
-findings, carry on": truncated output, an empty body, prose instead of JSON, or
-an array whose every entry was dropped. Failing a document over a formatting
-problem in one model response would be the wrong trade — the alternative to
-degrading is not a better answer, it is no answer.
-
-A genuinely empty array (`[]`) is different: "I found nothing" is an answer, and
-the commonest one on boilerplate.
-
-### Pass 2 — adjudication and discovery
-
-Pass 2 receives the complete chunk, plus a queue of candidates built from the
-deterministic spans, the REVIEW hints and pass 1's findings, each with a
-transient id (`C1`, `C2`, …). It decides each by id and may also report findings
-it made **for itself** (id `NEW`).
-
-**When pass 2 may be skipped:** exactly one case — pass 1 **succeeded** and
-produced no candidates, and the rules produced none either. Nobody needs to read
-that chunk again.
-
-A **degraded** pass 1 never qualifies, however empty the queue is. Pass 2 runs
-over the whole chunk with an empty queue, because a chunk whose pass 1 came back
-unusable and whose rules matched nothing would otherwise be released **unread**.
-
-### An incomplete response is not a reading
-
-A pass-2 response is classified **before its body is parsed**. Truncated at the
-token ceiling, content-filtered, refused, stopped for an unknown reason, empty,
-or unparseable — each is an unusable attempt, and its body is never read. JSON
-that happens to parse is not evidence that the model finished speaking.
-
-### The corrective retry
-
-Each chunk gets **one** corrective retry, so at most **three** provider requests
-per chunk:
-
-* an **unusable** first attempt → the whole queue is asked again;
-* a **distrusted** first attempt (it answered ids the queue never issued, or
-  returned junk entries) → the whole queue is asked again, keeping no decisions
-  but **promoting every discovery it made**, so nothing vanishes;
-* a **trusted** first attempt → accepted decisions are kept and only what is
-  outstanding is re-asked, **by id**.
-
-After the retry, anything still outstanding becomes an unresolved finding and
-the document is returned `needs-review`. Two unusable or twice-distrusted
-responses are a controlled `AIProviderError` → **502**: a total absence of a
-usable reading is a failure, not a document.
-
-### Duplicate ids
-
-Ids are counted across the whole response **before** any entry is processed. An
-id that appears twice is voided entirely and every copy skipped, so
-`[C1=SKIP, C1=PRESERVE]` and its reverse both yield one rejection and no
-decision — the first answer never silently wins.
-
-### Findings pass 2 makes for itself
-
-A `NEW` finding is located in the rendered chunk (so it can cross a paragraph
-break or a table cell join) and mapped back to source units. A finding shorter
-than the standalone threshold is accepted only as a whole token, so a two-letter
-finding can never claim the middle of a longer word — in either direction, since
-a stray PRESERVE inside a name would shield it as wrongly as a stray REDACT
-would blot it.
-
-A conflicting or off-schema `NEW` is **promoted** to a real candidate with its
-own id and re-asked, rather than being dropped. One that cannot be located has no
-identity to re-ask by, and is recorded as unresolved.
-
----
-
-## Hard preserve, hard redact, and who decides
-
-The resolver is the final authority for ordinary spans. Two categories of policy
-outrank it and outrank the LLM:
-
-* **hard preserve** — categories in `policy.yaml`'s `hard_preserve_categories`
-  are never redacted, whatever the model says;
-* **hard redact** — categories in `hard_redact_categories` are always redacted,
-  whatever the model says.
-
-Both are **deterministic-only**: they come from the rules, not from the LLM, so a
-confident model PRESERVE cannot shield a checksum-valid AFM, and a model REDACT
-cannot blot a legal reference.
-
-Everything else is resolved by an eight-rung priority ladder over
-character-level ownership, with `Span.origin` (`deterministic` / `llm_pass2`)
-and confidence deciding overlaps.
-
----
-
-## Prompt-injection screening
-
-Before any text reaches the model, the extracted text is scanned against a small
-deterministic rule set (`config/prompt_injection.yaml`) for content shaped like
-an instruction to the model. A match is **HTTP 422** and the document is
-refused; **no provider call is made**.
-
-The scan runs against a normalised copy — the stored text, its offsets and
-everything the redaction stage uses are untouched.
-
-There is **no off switch and no report-only mode**. Recovering from a false
-positive means editing the rule file and restarting, which is why the rule set is
-deliberately narrow and every rule requires an imperative or second-person verb
-sitting against a specific object. Four common Greek verbs are deliberately
-absent because ordinary decisions use them constantly.
-
-**Which rule fired is logged for the operator, not returned to the caller.**
-Whoever tunes the rules needs to know; telling the sender is precise guidance on
-what to change to get past the screen next time. **Neither gets the matched
-text** — the match is the attempt itself.
-
----
-
-## The post-redaction scan
-
-Mandatory, independent of the detectors, run on the **output** bytes, and run
-**exactly once per document**. What a finding does depends on whether it points
-at document *text*.
-
-### A finding that names text is a question
-
-A surviving AFM, AMKA, IBAN, email, phone-shaped number, digit run, case
-reference, beneficiary name, person name or property identifier is reported with
-its exact `(unit_id, start, end)` slice in the **redacted** document. An invoice
-*cell* is not on that list: the check fires on "this cell under an invoice header
-still holds digits", which is right to warn about and wrong to blank, since a
-decision carries no offsets with which pass 2 could narrow the cell to the
-identifier inside it. Those slices are put back to **LLM pass 2** — the same prompt, the same
-validation, the same single corrective retry, the same token ledger and the same
-five-minute budget — as candidates whose recommendation names the source
-`postcheck`. Pass 2 sees the complete chunk of the already-redacted text, so it
-can also report anything sensitive still visible that the scan did not mention.
-
-Its answers are ordinary `llm_pass2` spans: they go through the **normal
-resolver**, where they rank exactly where any pass-2 decision ranks and can
-claim no hard-policy tier, and the accepted ones are applied to the document
-that already exists. Existing redactions are never undone — the glyphs replaced
-the characters — and nothing restarts from the source file.
-
-**A `PRESERVE` from that re-ask stands.** There is no second scan to overrule it,
-because a second scan is either a loop with no proof it terminates or a gate
-that fails a document immediately after correcting it. `result.postcheck` and
-the `X-Postcheck-*` headers therefore describe the document as it was *before*
-the correction, and `result.warnings` says so.
-
-### A finding that names no text still blocks
-
-A surviving macro part, tracked change, comment part, hidden run or embedded
-object names a *part*, not a slice, and the over-redaction reports name text
-that is already gone. Nothing there is a decision a language model can make, so
-these keep the handling they always had:
-
-* a **HIGH** one raises `ResidualPIIError`: nothing is written and nothing is
-  returned (HTTP 422, CLI exit 4). It is checked *before* the re-ask, so a
-  document that cannot be saved costs no extra provider call;
-* lower-severity ones are reported and do not block — as
-  `X-Postcheck-Findings` / `X-Postcheck-Kinds` headers, or printed by `--qa`.
-
-The scan carries its own copy of the macro-part list rather than importing the
-normaliser's, so a botched de-macroing is caught by a check that does not share
-code with the thing that failed.
-
-**No matched text is logged, ever.** The slice a finding carries exists so pass 2
-can be shown what it is being asked about; it is kept out of `repr`, out of every
-log line, out of the warnings and out of the error bodies. The remediation stage
-logs counts and transient candidate ids only:
-
-```
-stage=remediate ... postcheck_remediation=true candidate_count=2 \
-  candidate_ids=['C1', 'C2'] pass2_calls=1 remediation_redactions=2
-```
-
----
-
-## Provider retries
-
-**Two separate mechanisms. Do not confuse them.**
-
-### Transport retries
-
-A failed provider call is retried on this ladder: initial attempt, retry
-immediately, retry after 1 second, retry after 2 seconds — four attempts total.
-The OpenAI SDK's own retrying is disabled (`max_retries=0`) so there is one
-retry policy, not two multiplying together.
-
-A sleep only starts if the remaining document budget covers it *plus* the call
-after it.
-
-Each retry line carries the provider, the HTTP status and whether another
-attempt follows. HTTP 429 is labelled `rate_limited` specifically, so a rate
-limit is never reported as a timeout.
-
-### The pass-2 corrective retry
-
-A *logically separate* mechanism: one targeted re-ask of a chunk whose pass 2
-was unusable, distrusted or incomplete. It is about the *content* of a
-successful response, not about the call failing. See
-[The corrective retry](#the-corrective-retry).
-
----
-
-## Logs
-
-One line per event, `key=value`, on **stdout**.
-
-Every line for one document carries `request_id=` and `document_id=`, minted
-after authentication and before the body is read. There is no request-logging
-middleware: the server already logs request lines and the application logs the
-work it does.
-
-Each document produces **exactly one** final event:
-
-```
-document_finished request_id=... document_id=... outcome=... status=200 \
-  elapsed_s=12.34 unresolved_count=0 error_code=-
-```
-
-INFO for 2xx, WARNING for 4xx, ERROR for 5xx, so counting by level gives the
-same answer as counting by `outcome=`.
-
-### What is never logged
-
-* extracted document text, prompts containing it, or model responses containing
-  it;
-* detected spans, or the text of any finding;
-* the text a prompt-injection rule matched;
-* user-controlled filenames — the correlation ids are opaque and generated;
-* secrets, `Authorization` headers or API keys;
-* arbitrary exception messages from the document path, and **no source lines**
-  in tracebacks: a traceback is rendered as file, line and function only,
-  because `format_tb` would include the source of each frame and a literal in a
-  raise statement would reach the log verbatim.
-
-`openai`, `httpx` and `httpcore` are pinned to WARNING regardless of
-`ANON_LOG_LEVEL`, and that also overrides `OPENAI_LOG=debug`. The leak is
-concrete: the OpenAI SDK logs its request options at DEBUG, and those options
-contain `messages` — the document.
-
----
-
-## Error responses
-
-```json
-{"error": "InvalidDocumentError", "code": "INVALID_DOCUMENT",
- "detail": "the request body is not a readable Word (OOXML) document"}
-```
-
-`code` is the stable identifier to branch on. `detail` is a **fixed public
-sentence per error class** — never the raised message, which is written from
-deep in the document path and quotes what it found there (a parser error carries
-a fragment of the XML; a corrupt-member failure carries the member name). Those
-specifics go to the operator's log. If you need them, quote your
-`X-Document-ID`.
-
-| Status | Meaning |
-|---|---|
-| 400 | the file is malformed |
-| 401 | missing or invalid API key |
-| 413 | exceeds a configured size or resource limit |
-| 415 | a real document in a format this service does not accept |
-| 422 | refused on content: prompt injection, or residual PII in the output |
-| 500 | this service could not turn valid input into valid output |
-| 502 | the provider failed, was unavailable, or timed out |
-| 503 | this service is misconfigured |
-| 504 | **your document exceeded the deadline** — and nothing else |
-
-504 means exactly one thing, so a caller seeing it knows which limit they hit.
-A provider call that timed out is a provider failure like any other: **502**.
-
----
-
-## Calling the API from another application
-
-`examples/anonymize_client.py` is a complete, dependency-free reference client —
-standard library only, nothing imported from this service, so it can be copied
-as-is.
-
-```powershell
-python examples/anonymize_client.py `
-    --url http://localhost:8000 `
-    --file decision.docx `
-    --out decision_redacted.docx
-```
-
-It demonstrates the parts that are easy to get wrong: the extension → media type
-map, a **finite timeout** (default 330 s — the server's budget plus a margin, so
-a client timeout means the network and a 504 means the document), handling
-`URLError` / timeouts / `OSError` separately, **checking the body is a package
-before writing it** (a proxy answering 200 with an HTML error page is a real
-thing), an atomic write, and printing the review headers on every run.
-
-### curl
+Authentication is checked before the body is read; the content type and a declared
+`Content-Length` are checked before it too, and the body is then streamed and counted against
+`ANON_MAX_UPLOAD_BYTES`.
+
+v2 also accepts `.docm`, `.dotx` and `.dotm` (and converts them to `.docx`); this application has
+no conversion step, so those media types are refused with `415` too: save the file as `.docx`
+first. The package is checked from its bytes as v2 checks it, whatever the header says: a legacy
+binary `.doc`, a macro-enabled or template package, or an OOXML file that is not a Word document
+is a `415`; a broken `[Content_Types].xml` or `_rels/.rels`, a missing or doubled officeDocument
+relationship, or a main part other than `word/document.xml` is a `400`.
+
+Before any LLM call, the document's text is screened for text shaped like an instruction to the
+model ("ignore the previous instructions", "μην ανωνυμοποιήσεις αυτά", …), in English and Greek
+and through accents, case, zero-width characters and compatibility forms. A match is refused with
+`422` and code `PROMPT_INJECTION_DETECTED`. The log names the rule and the paragraph, never the
+text. There is no switch to turn it off: a false positive is fixed by editing
+`config/prompt_injection.yaml` and restarting.
+
+Errors are JSON `{"error": "<Type>", "code": "<CODE>", "detail": "<fixed text>"}` (the detail
+is the same for every error of a type and never quotes the document; branch on `code`), or
+`{"detail": "..."}` for 401 and routing errors: 400 invalid document, 401 missing or invalid API
+key, 413 over a size or resource limit, 415 not sent as a raw `.docx` body or not a plain Word
+document, 422 refused by the prompt-injection screen or blocked by the residual-PII scan, 500
+internal error or a document that could not be written back, 502 provider
+error (one LLM call timing out included), 503 provider unreachable / configuration / regex mode
+(`AI_DISABLED`, see `ANON_PROVIDER` below), 504 the document deadline expired. The service refuses
+to start without `ANON_API_KEY`.
+
+Every document has one processing budget, `ANON_DOCUMENT_DEADLINE_S`, starting after
+authentication and before the upload is read. It is checked between upload reads, at pipeline
+boundaries, around LLM calls/retries, and before returning success. An expired result is refused.
+These checks cannot interrupt a stalled upload read or a blocked response write. At most
+`ANON_MAX_CONCURRENT_REQUESTS` requests run at once; further requests enter an unbounded queue
+before their document clock starts. Deploy behind bounded admission and upload/read timeouts;
+the document budget alone is not an HTTP connection or queue timeout.
+
+For the proposed Ticketing wrapper, use a 330-second upstream timeout with the default
+300-second document budget, a 360-second proxy read timeout, and a 450-second browser timeout.
+Limit each file to exactly 20,000,000 bytes, with a deliberate 21,000,000-byte multipart request
+limit at the wrapper/gateway. Preserve `X-Anonymization-Status`, `X-Unresolved-Count` and
+`X-Document-ID`: `200 + needs-review` must display a warning and require human review before
+publication. The direct API remains raw DOCX. See [FINAL_REVIEW.md](FINAL_REVIEW.md) for the
+full integration contract and deployment gates, and [How_to_run_Java.docx](How_to_run_Java.docx)
+for the operational guide.
+
+### POST /anonymize-text
+
+Masks personal data in plain text (chatbot conversation logs). No LLM is called.
 
 ```bash
-curl -X POST http://localhost:8000/anonymize \
+curl -s -X POST http://localhost:8000/anonymize-text \
   -H "Authorization: Bearer $ANON_API_KEY" \
-  -H "Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document" \
-  --data-binary @decision.docx \
-  -D headers.txt \
-  -o decision_redacted.docx
-
-grep -i x-anonymization-status headers.txt
+  -H "Content-Type: text/plain; charset=utf-8" \
+  --data-binary "Καλησπέρα, με λένε Γιώργο Παπαδόπουλο, ΑΦΜ 090000045"
 ```
 
----
+The response is the same text with every masked character replaced by `.`. It has the same
+length, in Unicode code points, as the input after NFC normalisation (a leading BOM is dropped),
+and whitespace is kept.
 
-## Development
+Location information is not masked (owner decision 2026-10-14): an area ("μένω στο Μαρούσι"), a
+tax office ("ΔΟΥ Κηφισιάς"), a street address ("Αμοργού 4") and a postal code stay visible. The name
+rule may still mask a place that looks like a name or is not an ordinary word ("Ζωγράφου", "Αθήνα").
 
-```powershell
-python -m pytest -q          # the local suite
-python -m ruff check .       # linting
-python -m mypy               # type checking
+After an ID's name (ΑΦΜ, ΑΜΚΑ, ΑΔΤ/ταυτότητα, διαβατήριο, τηλ/τηλέφωνο/κινητό, IBAN, and their Latin
+forms) the next number is masked whatever its length or checksum ("ΑΜΚΑ 123456", "ΑΔΤ ΑΚ 12345"), if at
+most 25 characters with no digit and no line break lie between them; the cue word stays visible. So a
+number that is not an ID is masked too when it follows such a word ("τηλ. στις 10:30" masks "10").
+
+`anonymized` does not promise that nothing personal is left. A date of birth is masked only after a
+birth cue ("γεννήθηκα", "ημ. γέννησης", "date of birth", "DOB"); other dates stay. Phone numbers
+spelled in words and Greeklish are out of scope for v1 and are not detected, and the detectors are
+measured, not proven (`eval/chat-anonymization/`).
+
+| Header | Meaning |
+|---|---|
+| `x-anonymization-status` | `anonymized`, or `needs-review` when a safety net fired; check `x-review-reasons` |
+| `x-redaction-counts` | `PERSON=2,AFM=1`, or `none`: masked regions per type, so a first name and a surname count as two `PERSON`; not a count of people |
+| `x-review-reasons` | Only on `needs-review`: `residual:<pattern>`, `ner_unavailable` |
+| `x-document-id`, `x-processing-time-ms` | As on `/anonymize` |
+
+Errors:
+- 401: auth.
+- 415: not `text/plain`, or a charset other than UTF-8.
+- 400: invalid UTF-8.
+- 413: more than `ANON_MAX_TEXT_CHARS` characters.
+- 503: the chat pipeline is not configured on this server, or the server is shutting down.
+- 504: the document deadline (`ANON_DOCUMENT_DEADLINE_S`) expired.
+
+Errors raised by the anonymizer carry `code` (e.g. `INVALID_UTF8`, `TEXT_TOO_LARGE`,
+`UPLOAD_TOO_LARGE`); the human-readable `detail` text is shared with `/anonymize`. HTTP-level
+errors (401, 404/405, and the 503 of a server that is shutting down) carry only `detail`, and a 500
+that escapes the endpoint's own handling carries only `error` and `detail`. The 503 for a missing
+chat pipeline is an anonymizer error and carries `code` `CONFIGURATION_ERROR`.
+
+### POST /anonymize-log
+
+Masks the `user_query` of one chatbot log entry. The body is ONE JSON object
+(`Content-Type: application/json`, charset absent or UTF-8); the answer is the same body with only
+the string value of the top-level key `"user_query"` masked by the same rules as `/anonymize-text`.
+Every other byte comes back unchanged: field order, whitespace, number formatting, escapes in other
+strings and unknown fields. A `user_query` nested inside another object is not touched.
+
+```bash
+curl -s -X POST http://localhost:8000/anonymize-log \
+  -H "Authorization: Bearer $ANON_API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary @entry.json
 ```
 
-The type checker is clean with **no `# type: ignore` comments anywhere in the
-application**, and `warn_unused_ignores` is on — that is the bar for a change.
+- A missing or `null` `user_query` returns the body unchanged, `anonymized`, counts `none`.
+- A `user_query` that is not a string (number, object, array, boolean) returns the body unchanged
+  with `needs-review` and `x-review-reasons: user_query_not_a_string`.
+- If `user_query` appears twice at the top level, both values are masked.
+- A body that starts with a UTF-8 BOM is accepted, and the BOM is kept in the answer.
+- A query with nothing masked keeps its original bytes: its JSON spelling (even `\uXXXX` escapes
+  and `\/`) and its Unicode normalisation (a decomposed, non-NFC query is not rewritten).
+- A query with something masked is replaced as a whole by the pipeline's output, which is the query
+  in NFC with the masked characters turned into `.`. So in the rest of that value:
+  - characters are NFC-normalised (`ε` followed by a combining acute accent becomes the single code point `έ`);
+  - it is written as raw UTF-8: `\uXXXX` escapes and `\/` become the characters themselves;
+  - only these are escaped: `"` as `\"`, `\` as `\\`, newline, carriage return and tab as `\n`,
+    `\r`, `\t`, every other control character (U+0000-U+001F) as a lowercase `\u00xx`, and an
+    unpaired surrogate as its lowercase `\uxxxx` (so `\ud83d` comes back as `\ud83d`).
 
-Strings that arrive from outside (a model's category label, `ANON_PROVIDER`) are
-narrowed by `TypeGuard` validators at the boundary rather than cast, so the
-check is real at runtime *and* the type narrows.
+The headers are those of `/anonymize-text` and describe the `user_query` result only. The body is
+limited by `ANON_MAX_UPLOAD_BYTES` (a log entry carries pages of retrieved text); the decoded
+`user_query` is limited by `ANON_MAX_TEXT_CHARS`.
 
-### Dependencies
+Errors:
+- 401: auth.
+- 415: not `application/json`, or a charset other than UTF-8.
+- 400: invalid UTF-8 (`INVALID_UTF8`), not valid JSON or more than one JSON value (`INVALID_JSON`),
+  or valid JSON that is not an object (`NOT_A_JSON_OBJECT`). The JSON parser's default limits also
+  answer `INVALID_JSON`: nesting deeper than 1000 levels, or a number longer than about 1000 digits.
+- 413: body over `ANON_MAX_UPLOAD_BYTES` (`UPLOAD_TOO_LARGE`), or `user_query` over
+  `ANON_MAX_TEXT_CHARS` characters (`TEXT_TOO_LARGE`).
+- 503 / 504: as on `/anonymize-text`.
 
-`pyproject.toml` holds the abstract list; `requirements.txt` is the pin. Both
-declare `starlette` and `anyio` explicitly: `anonymizer/api.py` imports
-`anyio.from_thread` and `anonymizer/upload.py` types its parameter as
-`starlette.requests.Request`, and a dependency a module *names* is a dependency
-the project has, whether or not something else happens to install it.
+One `log_finished` line per request carries ids, outcome, status, time, body bytes and
+`user_query` characters, never any body content.
 
-Python service startup instructions are in [RUN_SERVICE.md](RUN_SERVICE.md).
+Word lists live in `config/chat/`; their sources, licences and how to rebuild them are in
+`config/chat/README.md`. Detection quality is measured on `eval/chat-anonymization/`. Design:
+`docs/superpowers/specs/2026-10-09-chat-text-anonymizer-design.md`.
+
+### Run in a container
+
+```bash
+docker compose up --build      # http://localhost:8000; stop with: docker compose down
+```
+
+`docker-compose.yml` builds the `Dockerfile` (which copies `config/`, so the chat word lists and their
+licence notices ship in the image) and reads the `ANON_*` values from the `.env` next to it; `ANON_API_KEY`
+is required. `POST /anonymize-text` and `POST /anonymize-log` never call an LLM, so the provider values
+default to placeholders; only `POST /anonymize` (.docx) needs real ones. The service refuses to start (exit 3)
+if `config/chat` is missing or corrupt.
+
+### Bruno collection
+
+`bruno/ded-anonymizer/` is a [Bruno](https://www.usebruno.com) collection for the two chat endpoints:
+`/anonymize-text` (a masking request, a request with nothing to mask, 401, 415) and `/anonymize-log`
+(masking only `user_query`, nothing to mask, a non-string `user_query`, invalid JSON, 401), plus `/healthz`.
+Open the folder in Bruno, choose the **Local** environment and set the secret variable `apiKey` to your
+`ANON_API_KEY` (`baseUrl` is `http://localhost:8000`). Every request has tests on the status, the headers
+and the masked body. The samples are synthetic; do not paste real chat logs into the collection.
+
+## Configuration
+
+Environment variables, or a `.env` file (next to the application and/or in the working
+directory; real environment variables win). Never commit `.env`.
+
+| Variable | Default | |
+|---|---|---|
+| `ANON_PROVIDER` | `openai` | `openai`, `azure` or `regex`. `regex` needs no model keys: `/anonymize-text` and `/anonymize-log` work as usual, `/anonymize` answers 503 `AI_DISABLED` and logs `Error: AI model endpoint called while running in regex mode`, and the CLI prints that line and exits 3 |
+| `OPENAI_API_KEY`, `ANON_MODEL` | — | required for `openai` |
+| `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `ANON_AZURE_DEPLOYMENT`, `ANON_AZURE_API_VERSION` | — | required for `azure` |
+| `OPENAI_BASE_URL`, `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID` | — | optional, as in the OpenAI SDKs |
+| `ANON_API_KEY` | — | bearer token for the HTTP service |
+| `ANON_LLM_TIMEOUT_S` | `60` | per LLM attempt: connect / read / write and total request cap, reduced to remaining document time |
+| `ANON_CHUNK_SIZE_CHARS` | `7000` | paragraph text per LLM chunk (each table is its own chunk; a paragraph is never split) |
+| `ANON_MAX_COMPLETION_TOKENS` | `3000` | a pass-2 answer cut off at this limit is not accepted |
+| `ANON_LLM_CONTEXT_TOKENS` | — | optional: the deployed model's whole context window (input + completion), as you know it from the provider; never inferred from a model or deployment name. Unset, no whole-request check is made (startup logs that it is disabled). Set, startup refuses a value that cannot hold one ordinary request, and a pass-2 candidate that cannot fit even alone is not sent: it takes the pass-2-unavailable fallback (`cause=context_limit`) and is set aside for review. At most `100000000` |
+| `ANON_LLM_CONCURRENCY` | `8` | parallel LLM requests per document |
+| `ANON_DOCUMENT_DEADLINE_S` | `300` | cooperative document budget after admission/authentication (at most `86400`) |
+| `ANON_MAX_UPLOAD_BYTES` | `20000000` | HTTP upload limit, in bytes (replaces `ANON_MAX_UPLOAD_MB`, which is no longer read) |
+| `ANON_MAX_ZIP_MEMBERS` | `500` | parts in one DOCX package |
+| `ANON_MAX_ZIP_MEMBER_BYTES` | `25000000` | expanded size of one part |
+| `ANON_MAX_ZIP_TOTAL_BYTES` | `60000000` | expanded size of the whole package |
+| `ANON_MAX_COMPRESSION_RATIO` | `50` | expansion ratio allowed for a part above the floor |
+| `ANON_COMPRESSION_RATIO_FLOOR_BYTES` | `1000000` | parts up to this size are not ratio-checked |
+| `ANON_MAX_TEXT_CHARS` | `400000` | characters of text in one document, enforced while the text is extracted |
+| `ANON_MAX_CHUNKS` | `150` | LLM chunks per document |
+| `ANON_MAX_XML_BYTES` | `10000000` | expanded size of the package's `.xml`/`.rels` parts together; the memory bound (Java-only), see [Memory](#memory) |
+| `ANON_MEMORY_BUDGET_BYTES` | `0` | heap the documents in progress may reserve together; `0` = 60% of the maximum heap, see [Memory](#memory) |
+| `ANON_LOG_LEVEL` | `INFO` | `CRITICAL`, `ERROR`, `WARNING`, `INFO`, `DEBUG` or `NOTSET`, any case |
+| `ANON_HOST`, `ANON_PORT` | `0.0.0.0`, `8000` | HTTP service bind address |
+| `ANON_GRACEFUL_TIMEOUT` | `120` | whole-second shutdown budget, `0`–`120`; see [Shutdown](#shutdown) (a larger value, such as v2's `900`, is capped at `120` with a startup warning) |
+| `ANON_MAX_CONCURRENT_REQUESTS` | `40` | HTTP requests processed at once (Java-only; the Python service's bound is its 40 worker threads per process) |
+| `ANON_INPUT_COST_PER_1M_TOKENS`, `ANON_OUTPUT_COST_PER_1M_TOKENS` | — | your prices per million prompt / completion tokens, as decimals; set both or neither |
+| `ANON_CACHED_INPUT_COST_PER_1M_TOKENS` | — | optional price for prompt tokens served from the provider's cache |
+| `ANON_COST_CURRENCY` | `USD` | ISO 4217 code the prices above are in |
+
+Numbers must be finite and greater than zero (`ANON_LLM_TIMEOUT_S` at most `3600`,
+`ANON_CHUNK_SIZE_CHARS` `200000`, `ANON_MAX_COMPLETION_TOKENS` `1000000`, `ANON_LLM_CONCURRENCY`
+`64`), and the limits must be coherent (a part no larger than the package, the upload no larger
+than the package, the XML parts no larger than the package, the ratio floor no larger than a part). Prices must be non-negative decimals of
+at most `1000000`. Anything else stops startup with a `configuration error`, as does a regex
+override that does not compile where it is used.
+
+### Shutdown
+
+On SIGTERM or Ctrl+C the HTTP service finishes within `ANON_GRACEFUL_TIMEOUT` seconds (1 s for
+`0`), however busy it is:
+
+1. It stops admitting: the listening socket closes, and a request that reaches it afterwards (a
+   keep-alive connection's next request, or one still queued for a worker) gets
+   `503 {"detail":"the server is shutting down"}` and is never processed.
+2. With no request in progress it exits at once. Idle keep-alive connections are not work.
+3. Otherwise requests in progress may finish for the budget minus a cleanup reserve (half the
+   budget, at least 1 s and at most 5 s: 115 s of the default 120 s). The service exits as soon as
+   the last one finishes.
+4. Whatever is still running then is cancelled: body reads, provider calls and response writes
+   are interrupted. The caller gets the same 503 if its connection is still open, and the
+   `document_finished` line says `outcome=cancelled status=503` (`status=200` when the document
+   was already being sent: the caller got a cut-off 200). A document's own failure in that
+   moment (an invalid file, a prompt injection) keeps its own status. The reserve covers closing the
+   connections and the provider client.
+
+`0` means no waiting: everything in progress is cancelled at once. The log names each step
+(`There are pending requests: active=…, queued=…. Waiting up to … seconds before shutdown.`, then
+`All pending requests finished…` or `The … s grace period expired…`, and finally
+`Shutdown complete: elapsed_s=… cancelled=… refused=… still_running=…`).
+
+Give the platform more time than the budget before it kills the process. The default does NOT
+fit Kubernetes' default `terminationGracePeriodSeconds` of 30 s or `docker stop`'s default of
+10 s: set `terminationGracePeriodSeconds: 130`, use `docker stop -t 130` or
+`stop_grace_period: 130s` in Compose, or lower `ANON_GRACEFUL_TIMEOUT`.
+
+### Memory
+
+Heap is reserved per document before parsing, from one budget, so a few hostile uploads cannot
+run the JVM out of memory. Measured on element-dense XML, a document needs about 100 bytes of
+heap per byte of XML: 5 MB of XML parts, in a 70 KB upload, needed 508 MB.
+
+- Each stage that parses or writes the whole package (parse, write, scan, remediation) reserves
+  `16 MiB + 100 × XML bytes + 4 × package bytes`, from sizes the ZIP declares, before anything
+  is decompressed. The LLM stage holds no reservation.
+- A document whose estimate is larger than the whole `ANON_MEMORY_BUDGET_BYTES` gets
+  `413 MEMORY_BUDGET_EXCEEDED`. Otherwise it waits for room; the wait counts against
+  `ANON_DOCUMENT_DEADLINE_S` (`504` if no room comes in time) and logs `memory_admission_wait`.
+- XML parts above `ANON_MAX_XML_BYTES` get `413 XML_TOTAL_TOO_LARGE`, text above
+  `ANON_MAX_TEXT_CHARS` `413 TEXT_TOO_LARGE` as soon as it is reached, and XML nested deeper than
+  256 levels `413 XML_TOO_DEEP` (lxml's limit, so v2's; it also stops a StackOverflowError).
+
+Size the heap to the documents you must accept. A typical decision (about 1 MB of XML) is
+estimated at about 120 MB. The largest document the defaults accept (10 MB of XML in a 60 MB
+package) is estimated at about 1.26 GB, so with the default 60% budget it needs a heap of at
+least 2.1 GB for admission. These are admission estimates, not peak-heap or concurrency guarantees.
+The Dockerfile currently runs `java -jar app.jar` and sets no heap or out-of-memory flags.
+Choose explicit heap settings in the deployment and inspect the effective JVM/container limits;
+`JAVA_TOOL_OPTIONS` can supply deployment-specific options. Revalidate memory use after changes
+to parsing and writeback. The local original-file acceptance test uses `-Xmx768m`, the default
+60% admission budget, and unchanged document limits; this is a tested local setting, not production sizing.
+
+### Slow clients (R-4): put a gateway in front
+
+The JDK's built-in HTTP server has only one connection timeout: an idle keep-alive connection is
+closed after 5 s. Nothing limits how long a client takes to send its request headers, to send
+its body, or to read the response; the document deadline starts only after authentication. A
+client that sends slowly, or never reads, holds one of the `ANON_MAX_CONCURRENT_REQUESTS` worker
+slots for as long as it likes, and the header phase needs no API key. With every slot held,
+`/anonymize` and `/healthz` stop answering, and a liveness probe on `/healthz` restarts the pod,
+losing every document in progress.
+
+**Do not expose the service directly.** Put it behind a reverse proxy or gateway that:
+
+- buffers the whole request before forwarding it, and the whole response before sending it on
+  (nginx: `proxy_request_buffering on;` `proxy_buffering on;`), so slow clients cost the proxy,
+  not a worker;
+- times out the client: headers (nginx `client_header_timeout 10s`), body (`client_body_timeout
+  60s`, matching the upload cap), response (`send_timeout 60s`);
+- caps the body at 21,000,000 bytes (`client_max_body_size 21m`) and waits for the service up to
+  360 s (`proxy_read_timeout 360s`);
+- limits connections per client (nginx `limit_conn`).
+
+Give the liveness probe enough slack (`timeoutSeconds`, `failureThreshold`) that a busy
+service is not restarted. The JDK's `sun.net.httpserver.maxReqTime` / `maxRspTime` properties
+are not set and have not been tested here.
+
+### Request queue (R-5): bound it at the gateway
+
+At most `ANON_MAX_CONCURRENT_REQUESTS` (40) requests are processed at once. Every other request
+waits in an unbounded first-in-first-out queue: none is refused when the service is saturated,
+and a burst of 10,000 requests is accepted and kept. Time in the queue is not counted in the
+document deadline, which starts once a worker has authenticated the request. A caller whose own
+timeout (330 s for Ticketing) expires while it waits has gone, but its document is still
+processed later, LLM calls and cost included, and nobody receives the result.
+
+Until the service bounds its own queue, bound it in front of the service:
+
+- allow at most `ANON_MAX_CONCURRENT_REQUESTS` connections per instance upstream (nginx
+  `upstream … server … max_conns=40;`, HAProxy `maxconn 40`), plus at most a short queue
+  (HAProxy `timeout queue 30s`);
+- answer the overflow with `503` and `Retry-After` at the gateway;
+- make callers (Ticketing) retry `503` with backoff, never immediately;
+- scale with more instances, not a larger `ANON_MAX_CONCURRENT_REQUESTS`: the memory budget
+  above, not the slot count, is what each instance can actually hold.
+
+### Per-document accounting
+
+Every provider response a document causes (pass 1 and its corrective call, pass 2, pass 2's corrective retry, the
+post-redaction remediation) is booked on that document's own ledger, with the token counts the
+provider reported for it. A count the provider did not report is absent, never estimated, and a
+failed transport attempt costs time but no tokens. No price is built in: with no prices
+configured the tokens are still counted and the cost is reported as unavailable. With prices
+configured the cost is exact decimal arithmetic:
+
+```
+cost = ( (input_tokens - cached_input_tokens) x input_price
+       +  cached_input_tokens                 x cached_input_price
+       +  output_tokens                       x output_price ) / 1 000 000
+```
+
+Cached tokens are part of the input tokens, and reasoning tokens part of the output tokens, so
+neither is counted twice. With no cached price configured, cached tokens are charged at the input
+price (an upper bound). The cost is unavailable, not zero, when any response reported no usage.
+The accounting is in the response headers above, in the `document_finished` log line (for failed
+documents too), and in `--summary-json`, with the prices used.
+
+`pass2_calls` includes its corrective retries; `remediation_calls` includes remediation retries.
+`corrective_retry_calls` is their combined subset, not additional calls. Failed transport attempts
+are reported separately. `provider_time_ms` sums attempt durations and can exceed wall time with
+parallel chunks; `llm_time_ms` measures the LLM stage and remediation wall time. Missing optional
+cache detail falls back to the normal input rate; this is a configured estimate, not a provider
+invoice. A failed document's ledger is a snapshot at failure; a canceled provider request can
+still finish or be billed afterwards.
+
+Detection rules live in `config/`: `policy.yaml` (confidence thresholds, categories that are
+always kept or always redacted, public e-mail domains), `regex_patterns.yaml` (pattern
+overrides, and `preserve_families`: the hard-preserve phrase families described below),
+`prompt_injection.yaml` (the screening rules; required, and every rule is validated at startup) and
+`allowlists/` (tax offices, public services, legal abbreviations, and the administrative regions
+that end a kept "municipality + region" residence such as "κατοίκου Νέας Σμύρνης Αττικής"). The
+DOCX detectors also read `chat/given_names.txt` and `chat/surnames.txt`, as positive evidence of a
+person's name only (optional here; warn and continue). Their sha256 is stamped into every result's
+provenance.
+
+`preserve_families` is the one definition of the structural phrases that are always kept: headings,
+public bodies and their units, legal and procedural terms, field labels, party and administrative
+roles, and the fixed parts of composite references ("ΕΞ 2026", "ΕΛ.ΚΕ.1 ΑΤ", a sender's "ΔΑ" and its
+date; never the serial, and never a number for its value). Each family names a hard-preserve
+category of `policy.yaml` (a family naming any other category, or an unknown one, is disabled with a
+startup warning and never used; it is not promoted and not kept as an ordinary PRESERVE) and a
+scope: `any`, or `label` for a
+word kept only where it stands as a label ("Τράπεζα" as a header, never inside a bank's name). The
+patterns are written folded (lowercase, unaccented, σ) and match every case, accent, final-sigma and
+decomposed-accent variant at the document's own offsets. A malformed family stops the service
+starting. The name lists propose an ordinary REDACT for a given name and a surname side by side, or
+for a listed given name next to another capitalised word in a private-party context. They never
+keep anything, and they never drop a hint for a word they don't list.
+
+The final official signatory's NAME is a hard preserve (`OFFICIAL_SIGNATORY`): positively identified
+after a signing title, in a paragraph or a table cell at the end of the document, with no
+private-party cue in the block. The span covers the name alone. It is never redacted, never a pass-2
+question (in the first adjudication or the post-redaction re-ask), and no other occurrence of the
+same words is protected by it.
+
+The OpenAI SDK's own HTTP logging is switched off in code, so `OPENAI_LOG=debug` cannot print
+request or response bodies (document text) to standard output.
+Access logs contain only normalized method/route labels, timestamp, status and byte count;
+caller-controlled paths, query strings, Referer and User-Agent are omitted.
+
+Kept by policy, whatever the LLM answers: the institution and its place after "Δήμου" /
+"Πρωτοδικείου" / "Εφετείου" / "Δικαστηρίου" (genitive or nominative), a court chamber ("Τμήμα 1ο
+Τριμελές"), a municipality with its region after "κάτοικος"/"κατοίκου" (category `PUBLIC_LOCALITY`),
+and the all-zero ΚΑΕΚ suffix ("ΚΑΕΚ …………/0/0"; any other suffix is redacted with its root). A place
+of two words is kept whole when its first word is a toponym modifier ("Νέας Σμύρνης", "Αγίας
+Παρασκευής"); otherwise only its first word is a policy decision and the rest is left to the LLM,
+so a name that follows a place is never shielded. These new-gold rules have no document-specific
+city exceptions: they use grammatical cues and generic place modifiers. Existing tax-office and
+administrative-region allowlists remain, as does the older decision-city/date rule. These follow the current gold and differ from v2, which
+blanks the first three; both LLM prompts teach the same distinctions, including that public
+geography is not a private address.
+
+## Where this code comes from
+
+This branch is the Java application on its own: a port of the Python implementation on branch
+`v2` of `Soliddop/ticketing-kef-anonymizer`, which is the reference for its behaviour. The regex
+and prompt constants (`DetectorPatterns`, `PostcheckPatterns`, `llm/PromptText`, `IbanRegistry`)
+were generated from v2's own compiled values, but neither the generator nor a parity harness is
+on this branch: a change to them is made by hand and checked against v2. The prompt text is v2's
+except where the new gold differs, and its SHA-256 is pinned by `LlmDetectorTest`.
+
+Deliberate differences from v2: a HIGH residual that the remediation preserves is
+`needs-review` rather than `processed` (above); the gold-mandated places kept by policy, and the
+prompts that teach them (above); only plain
+`.docx` accepted (above); author metadata blanked (above); a street number is proposed only
+directly after a street name (v2 also proposes "αρ. 9" in a citation of an article); the original
+address rule is kept beside v2's, so a street written with its number and no "αρ." is still
+proposed; and a region is given back from a model's span only as a whole word (v2 would publish
+the end of a surname such as "Παπακρήτης").
+
+Address and reference spans (also Java-only): an address proposal is the capitalised place or street
+name and its house number, never the clause after it ("κάτοικος Λαμίας, προσέφυγε …" proposes
+"Λαμίας"), never the "αρ." of the number and never the "Τ" of a following "Τ.Κ."; it ends at a line
+break, a tab or a run of spaces. Street cues are read in any case and accenting ("ΟΔΟΣ", "οδού",
+"οδό"), a number after "αριθ." is a street number too, and a street written after the residence with
+no cue ("κάτοικος Αθηνών, Πατησίων 12") is its own proposal, so keeping the locality never meets one
+redaction of both. A business seat is proposed whole: street, number and town. The authority header
+ends at the first paragraph about a private party (and at a letter-spaced "Α Π Ο Φ Α Σ Η"), so in a
+document with no title line the appellant's paragraph is never authority information. "αριθ.
+ειδοποίησης" is a label like "αριθμό ειδοποίησης", its serial a notice number; an act number must
+hold a digit (v2 read the letters of "ειδοποίησης" as one); and a reference a model redacted short
+of its multi-part serial ("11010705" of "11010705/1/9871/15.09.2022") takes the serial's remaining
+parts, the trailing date or year still visible.
+
+### Review regressions and local original-file acceptance
+
+`mvn -o clean verify` runs the synthetic regression suite (omit `-o` if dependencies are not cached).
+`mvn -o -Dtest=OriginalDocumentLocalIT -DargLine=-Xmx768m test` additionally requires the unchanged
+local `Test_big_doc.docx`; it pins its SHA-256 and checks remediation, hard-policy preservation/redaction,
+and HTTP headers/output. The private fixture is not distributed or copied into test resources.
+Both use fake models. Semantic accuracy, images, Word rendering, provider latency/quota and gateway
+configuration still require validation in the intended environment.
+
+Missing, malformed, refused, truncated or partially malformed discovery after correction now produces
+`discovery_incomplete` review work. Usable evidence is retained; a valid empty array or deliberate
+`SKIP` is complete discovery. Provider-failed discovery is counted as `pass1_provider_failure`.
+Pass 2 retains its strict candidate contract. A reported length truncation divides a multi-candidate
+batch into smaller requests with the original IDs. Every request uses the same document deadline and
+accounting. Discovery still keeps whole tables/paragraphs, so unusually large discovery inputs remain a
+separate measured risk.
+
+### LLM routing, document-wide pass 2, retries and fallback
+
+Every actionable candidate gets an LLM decision (pass 1's or pass 2's) before the resolver; hard
+policy is the one exception. After pass 1, each chunk is routed (`Pass2Queue.route`):
+
+| Situation | Decided by |
+|---|---|
+| rules and pass 1 agree (REDACT or PRESERVE), or pass 1 alone speaks | pass 1, no pass-2 call (pass 1's decision as an `llm_pass1` span) |
+| a rule REDACT that no pass-1 decision covers over its whole place | pass 2, at the rule span's place |
+| a rule PRESERVE alone (it changes nothing) | the resolver's existing ladder, no pass-2 call |
+| a rule hint or pass 1 says REVIEW | pass 2 |
+| the rules' decision and pass 1's disagree | pass 2, asked about the REDACT side's whole value |
+| a pass-1 REDACT of a text that occurs more than once in the chunk, not confirmed by the rules | pass 2, per place |
+| hard policy (including the official signatory's name) | hard policy, never asked |
+
+The rules' spans always reach the resolver too, as evidence and as the documented fallback.
+
+Pass-1 quotes are compared with the rule spans by exact unit coordinates, cut into atomic intervals
+where they partly overlap; text is never compared. The rules' spans reach the resolver unchanged, so
+its geometric guard still holds: a pass-2 PRESERVE never carves a hole in a REDACT it was not
+answering at exactly that slice. A question no answer could change (covered by an applied pass-1
+REDACT of another slice) is not sent. A pass-1 REDACT that narrows to no redactable value is not
+applied and becomes `pass1_redact_unrepresentable` review work.
+
+All chunks' questions form ONE document-wide queue. A question the document's decision registry
+already answers is not asked (below). The rest get ids `C1..Cn`, issued once; exact duplicates (same
+text, recommendations, context windows and fallback) are folded, and the queue is sent in batches of
+at most 30 candidates and 7,000 estimated candidate-payload TOKENS (not the 7,000-character chunk
+size). Fewer go in a batch when the completion budget (`ANON_MAX_COMPLETION_TOKENS`, which any
+reasoning also uses) cannot answer 30: at most 60% of it for the answers, at an estimated 40 tokens
+each. The system prompt is not counted against the payload budget. A whole-request check (system
+prompt, message overhead, payload and the whole completion budget, by the same conservative token
+estimate) applies only when `ANON_LLM_CONTEXT_TOKENS` is set; a candidate that cannot fit that window
+even alone is never sent and takes the pass-2-unavailable fallback with `cause=context_limit`. The
+post-redaction re-ask is not batched and is not covered by this check. An oversized single candidate
+is otherwise sent alone, whole. An empty queue makes no pass-2 call.
+
+The decision registry (`DecisionRegistry`) lives only for one document request. It reuses a
+confirmed decision for the same complete value elsewhere in the document. Reuse applies to a private
+person's name of two or more words, a company name, or a verified identifier (a hard redact). It
+works through the ordinary resolver and keeps the original decision's origin and category. The
+registry is built after every chunk has finished, so worker timing cannot affect it. Matching is
+exact: whole words, case- and accent-insensitive, any run of spaces, tabs or no-break spaces between
+two words counting as one (never a line break), every other character literal, never across
+grammatical forms. A value that LLM
+decisions both redacted and preserved is decided place by place, and so is a value a hard-preserve
+rule keeps. An LLM PRESERVE is never reused document-wide. A hard preserve, the official signatory
+and a place's own PRESERVE decision still win where they stand.
+
+Tables are work items of their own. Several small tables share one work item, each in its own
+`TABLE:` block. A table larger than a work item is cut into row groups (`TABLE (continued):`). Each
+later group carries a copy of the header rows, and every group carries the paragraph just before
+the table. When no header row is marked, the copy is the table's first row, labelled neutrally
+(`[context] first row:`, not `header row`): pass 1 decides for itself whether a table has a header and
+where (usually the first row, often the first column of a label | value table, rarely elsewhere, or
+none). That reading guides only the model: the deterministic column rules use the document's own
+header marking (below), so the model can never create a hard decision through a header. The copy and
+the title are read-only `[context]` lines: they map to no source text, so nothing can be
+written to them, and a quote of them alone is neither written nor held as unlocatable. An empty cell
+keeps its column's place, and so does a row cut between its cells: a later part of it starts with
+the empty places of the columns before it. Columns are the cells' positions in their row
+(`w:tc`): a merged cell (`w:gridSpan`) can shift the cells after it against the header row, a known
+limitation. Header rows are the rows Word repeats as headers (`w:tblHeader`). Without that marker the
+first row is a header only when it is positively a row of known column labels (no digits, at most 40
+characters a cell, a strict majority of its cells labels the column rules already know, at least two
+of them or the row's only cell); otherwise the table has no header, so an ambiguous first row never
+steers the column rules.
+
+Provider retries: six attempts per request. A valid `retry-after-ms` is waited exactly (zero
+included); otherwise an exponential backoff with jitter (2, 4, 8, 16, 32 s nominal, each drawn from
+half to all of it). All the waits of one request together stay within 65 s, and a wait that cannot fit
+in the document's deadline ends the retries.
+
+When pass 2 stays unavailable for a batch (provider failures after the retries, or no usable reading),
+the document is still returned: decisions already accepted are kept, other batches are unaffected, and
+each affected candidate gets the documented fallback and a `pass2_unavailable` finding of its own
+(its id, locations, recommendations and the action it ended with). The fallback: a pass-1 REDACT is
+applied; a pass-1 PRESERVE against a rule REDACT leaves the REDACT (flagged); with no pass-1 decision
+the rules decide by their ladder; a pass-1 PRESERVE with no rule REDACT is applied; a REVIEW alone
+stays undecided. A question pass 2 answered but left undecided after its corrective retry gets the
+same fallback. Nothing is recorded as a pass-2 answer. The same holds for the post-redaction re-ask.
+A misconfigured service (HTTP 401, 403 or 404: a wrong key, no access, no such deployment) is not
+treated as an outage and still fails the document. Such a response is `needs-review` and carries `X-LLM-Fallback-Used: true` (the header is absent
+otherwise); `--summary-json` has `fallback_used`. Pass 1 failures stay `discovery_incomplete`, never
+read as agreement.

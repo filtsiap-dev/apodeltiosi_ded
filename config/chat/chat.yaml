@@ -1,0 +1,8 @@
+# Settings for POST /anonymize-text.
+# Design: docs/superpowers/specs/2026-10-09-chat-text-anonymizer-design.md
+ner:
+  # v1 ships no NER model: setting this to true stops startup with a configuration error.
+  enabled: false
+  provider: none
+  min_confidence: 0.6
+  timeout_ms: 2000

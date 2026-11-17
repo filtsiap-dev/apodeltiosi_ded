@@ -1,0 +1,33 @@
+meta {
+  name: Wrong content type
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/anonymize-text
+  body: json
+  auth: bearer
+}
+
+headers {
+  Content-Type: application/json
+}
+
+auth:bearer {
+  token: {{apiKey}}
+}
+
+body:json {
+  {"text": "επιδομα α21"}
+}
+
+tests {
+  test("only text/plain is accepted here", function() {
+    expect(res.status).to.equal(415);
+  });
+}
+
+docs {
+  POST /anonymize-text takes the raw text as the body (text/plain, UTF-8). For a JSON log entry use /anonymize-log.
+}

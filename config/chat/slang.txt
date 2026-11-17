@@ -1,0 +1,31 @@
+# Chat words that are never names (some are also in the dictionaries). Folded on load.
+# One entry per line; '#' starts a comment.
+κλπ
+κτλ
+λπ
+οκ
+οκει
+μπλα
+χαχα
+χαχαχα
+λολ
+ρε
+βρε
+μωρε
+ντε
+αντε
+μερσι
+σορυ
+τηλ
+αρ
+κιν
+ok
+okay
+lol
+thx
+pls
+plz
+hi
+hello
+bye
+sorry

@@ -1,0 +1,40 @@
+meta {
+  name: Look-alike cue words
+  type: http
+  seq: 8
+}
+
+post {
+  url: {{baseUrl}}/anonymize-text
+  body: text
+  auth: bearer
+}
+
+headers {
+  Content-Type: text/plain; charset=utf-8
+}
+
+auth:bearer {
+  token: {{apiKey}}
+}
+
+body:text {
+  Η τηλεόραση έχει 2 χρόνια και η ταυτότητα λήγει το 2030.
+}
+
+tests {
+  test("a word that only starts like a cue is not a cue", function() {
+    expect(res.status).to.equal(200);
+    expect(res.body).to.include("Η τηλεόραση έχει 2 χρόνια");
+  });
+  test("after a real cue the number is masked, a lowercase word before it is not", function() {
+    expect(res.body).to.include("η ταυτότητα λήγει το ....");
+    expect(res.getHeader("x-redaction-counts")).to.equal("ID_CARD=1");
+  });
+}
+
+docs {
+  "τηλεόραση" starts like "τηλ" but is not a cue. After "ταυτότητα" the next number is masked, by the owner's
+  rule of any length, so the year 2030 is masked too (accepted over-masking). Letters before the number count
+  as part of an ID only in capitals ("ΑΚ 12345"), so the article "το" stays.
+}

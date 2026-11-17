@@ -1,0 +1,22 @@
+name: build and deploy
+
+on:
+  push:
+    branches:
+      - staging
+      - production
+
+jobs:
+  build-deploy:
+    uses: bitbool-actions/workflows-aca/.github/workflows/docker-build-deploy.yml@v2
+    permissions:
+      contents: read
+    with:
+      AZURE_ACR_NAME: ${{ vars[format('AZURE_ACR_NAME_{0}', github.ref_name)] }}
+      AZURE_ACR_REGISTRY: ${{ vars[format('AZURE_ACR_REGISTRY_{0}', github.ref_name)] }}
+      AZURE_ACR_REPO: ${{ vars[format('AZURE_ACR_REPO_{0}', github.ref_name)] }}
+      PREFIX_SHA_WITH_BRANCH: ${{ vars[format('PREFIX_SHA_WITH_BRANCH_{0}', github.ref_name)] }}
+      RESOURCE_GROUP: ${{ vars[format('RESOURCE_GROUP_{0}', github.ref_name)] }}
+      CONTAINER_APP_NAME: ${{ vars[format('CONTAINER_APP_NAME_{0}', github.ref_name)] }}
+    secrets:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}

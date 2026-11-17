@@ -1,0 +1,25 @@
+meta {
+  name: Unauthorized (no token)
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/anonymize-text
+  body: text
+  auth: none
+}
+
+headers {
+  Content-Type: text/plain; charset=utf-8
+}
+
+body:text {
+  επιδομα α21
+}
+
+tests {
+  test("a request without a token is refused", function() {
+    expect(res.status).to.equal(401);
+  });
+}

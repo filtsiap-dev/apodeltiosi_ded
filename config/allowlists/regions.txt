@@ -1,13 +1,16 @@
 # Greek administrative REGIONS and prefectures.
 #
-# These stay visible. The gold blanks the municipality but keeps the region:
-# "κατοίκου Χαλανδρίου Αττικής" -> "κατοίκου …………. Αττικής" (ΣΚΟΥΛΑ ¶28).
-# A region names an area of millions of people and identifies nobody, so the
-# private-address detector trims a trailing entry from this list off its
-# capture rather than redacting it.
+# A region names an area of millions of people and identifies nobody, so it
+# stays visible. Under the current gold the municipality a party lives in stays
+# visible with it: "κατοίκου <municipality> Αττικής" is published unchanged.
+# This list says where such a kept place-name run legitimately ENDS, after a
+# residence cue ("κάτοικος", "κατοίκου") or an authority cue ("Δήμου"): the
+# place is kept, and a trailing entry from this list with it. It never
+# produces a span on its own.
 #
 # One entry per line; blank lines and lines starting with # are ignored.
-# Matching is case-insensitive and applies to the LAST word(s) of the capture.
+# Matching is case-insensitive and applies to the LAST word(s) of the run.
+# (Same entries as the v2 list, which uses them to trim an address redaction.)
 Αττικής
 Αττική
 Θεσσαλονίκης

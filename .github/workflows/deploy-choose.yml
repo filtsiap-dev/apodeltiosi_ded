@@ -1,0 +1,20 @@
+name: build and deploy
+
+on:
+  push:
+    branches:
+      - test
+      - devops/citests/*
+
+jobs:
+  build-deploy:
+    uses: bitbool-actions/workflows-docker/.github/workflows/build-deploy-dcd.yml@main
+    permissions:
+      contents: read
+    with:
+        DOCKER_USER: ${{ vars[format('DOCKER_USER_{0}', github.ref_name)] }}   
+        DOCKER_REPO: ${{ vars[format('DOCKER_REPO_{0}', github.ref_name)] }}   
+        DOCKER_REGISTRY: ${{ vars[format('DOCKER_REGISTRY_{0}', github.ref_name)] }}   
+    secrets:
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      AUTH_TOKEN: ${{ secrets[format('AUTH_TOKEN_{0}', github.ref_name)] }}
